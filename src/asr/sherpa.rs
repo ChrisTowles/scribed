@@ -36,21 +36,25 @@ pub struct ModelBundle {
 }
 
 impl ModelBundle {
-    /// Standard layout under a directory.
+    /// Resolve the bundle under `dir`. Auto-detects whether the directory
+    /// contains the `*.int8.onnx` (quantized) variant or the `*.onnx`
+    /// (fp32/fp16) variant.
     pub fn from_dir(dir: &Path) -> Self {
+        let int8 = dir.join("encoder.int8.onnx").exists();
+        let suffix = if int8 { ".int8.onnx" } else { ".onnx" };
         Self {
-            encoder: dir.join("encoder.onnx"),
-            decoder: dir.join("decoder.onnx"),
-            joiner: dir.join("joiner.onnx"),
+            encoder: dir.join(format!("encoder{suffix}")),
+            decoder: dir.join(format!("decoder{suffix}")),
+            joiner: dir.join(format!("joiner{suffix}")),
             tokens: dir.join("tokens.txt"),
         }
     }
 
     pub fn validate(&self) -> Result<(), AsrError> {
         for (label, p) in [
-            ("encoder.onnx", &self.encoder),
-            ("decoder.onnx", &self.decoder),
-            ("joiner.onnx", &self.joiner),
+            ("encoder", &self.encoder),
+            ("decoder", &self.decoder),
+            ("joiner", &self.joiner),
             ("tokens.txt", &self.tokens),
         ] {
             if !p.exists() {
@@ -112,11 +116,21 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn from_dir_lays_out_canonical_filenames() {
-        let dir = std::path::Path::new("/tmp/parakeet");
-        let b = ModelBundle::from_dir(dir);
-        assert_eq!(b.encoder, dir.join("encoder.onnx"));
-        assert_eq!(b.tokens, dir.join("tokens.txt"));
+    fn from_dir_falls_back_to_plain_onnx_when_no_int8() {
+        let dir = tempdir().unwrap();
+        let b = ModelBundle::from_dir(dir.path());
+        assert_eq!(b.encoder, dir.path().join("encoder.onnx"));
+        assert_eq!(b.tokens, dir.path().join("tokens.txt"));
+    }
+
+    #[test]
+    fn from_dir_picks_int8_when_present() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("encoder.int8.onnx"), b"stub").unwrap();
+        let b = ModelBundle::from_dir(dir.path());
+        assert_eq!(b.encoder, dir.path().join("encoder.int8.onnx"));
+        assert_eq!(b.decoder, dir.path().join("decoder.int8.onnx"));
+        assert_eq!(b.joiner, dir.path().join("joiner.int8.onnx"));
     }
 
     #[test]
@@ -130,7 +144,12 @@ mod tests {
     #[test]
     fn validate_passes_with_all_files_present() {
         let dir = tempdir().unwrap();
-        for name in ["encoder.onnx", "decoder.onnx", "joiner.onnx", "tokens.txt"] {
+        for name in [
+            "encoder.int8.onnx",
+            "decoder.int8.onnx",
+            "joiner.int8.onnx",
+            "tokens.txt",
+        ] {
             fs::write(dir.path().join(name), b"stub").unwrap();
         }
         let b = ModelBundle::from_dir(dir.path());

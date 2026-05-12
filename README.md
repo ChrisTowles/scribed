@@ -13,21 +13,28 @@ In development. The Rust port of [claude-stt](https://github.com/) (Python). Pha
 ## Quick start
 
 ```bash
-# Build
+# Build with the ASR engine (downloads sherpa-onnx native libs into target/)
 cargo build --release --features asr
 
-# Show config + status
+# Fetch the Parakeet model bundle (~460 MB, cached at ~/.cache/scribed/)
+./target/release/scribed fetch-model
+
+# End-to-end smoke test: transcribe a WAV without starting the daemon
+./target/release/transcribe_wav ~/.cache/scribed/sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8/test_wavs/0.wav
+# → Transcript:  Well, I don't wish to see it any more, observed Phebe,...
+# → Inference: ~115 ms (64x realtime on CPU)
+
+# Daemon control
 ./target/release/scribed status
-
-# Start in background
-./target/release/scribed start --background
-
-# Toggle recording (or press the hotkey: default Ctrl+Shift+Space)
+./target/release/scribed start --background     # ctrl+shift+space to record
 ./target/release/scribed toggle
-
-# Stop daemon
 ./target/release/scribed stop
 ```
+
+The shared `libsherpa-onnx-c-api.so` is downloaded into `target/release/` by
+`sherpa-rs-sys`; an `$ORIGIN` rpath ([`build.rs`](build.rs)) lets the binary
+find it without `LD_LIBRARY_PATH`. For distribution, ship the binary alongside
+the two `.so` files.
 
 ## Platform requirements
 

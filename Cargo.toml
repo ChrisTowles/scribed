@@ -52,6 +52,9 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 # Optional ASR backend
 sherpa-rs = { version = "0.6", optional = true }
 
+# Used by the transcribe_wav smoke-test binary (feature = "asr")
+hound = "3"
+
 [target.'cfg(target_os = "linux")'.dependencies]
 nix = { version = "0.29", features = ["signal", "process", "fs", "term"] }
 evdev = "0.13"
@@ -70,6 +73,7 @@ assert_cmd = "2"
 predicates = "3"
 proptest = "1"
 tempfile = "3"
+hound = "3"
 
 [[bin]]
 name = "scribed"
@@ -78,6 +82,10 @@ path = "src/main.rs"
 [[bin]]
 name = "audio_probe"
 path = "src/bin/audio_probe.rs"
+
+[[bin]]
+name = "transcribe_wav"
+path = "src/bin/transcribe_wav.rs"
 
 [profile.release]
 lto = "thin"

@@ -51,6 +51,8 @@ pub enum Command {
     Toggle,
     /// Print the resolved config (after sanitization) and exit.
     PrintConfig,
+    /// Download the ASR model bundle to the local cache and exit.
+    FetchModel,
 }
 
 pub fn run() -> Result<()> {
@@ -76,6 +78,14 @@ pub fn run() -> Result<()> {
         Command::PrintConfig => {
             let toml = config.to_toml()?;
             println!("{toml}");
+        }
+        Command::FetchModel => {
+            let target = crate::asr::download::ensure(
+                &crate::asr::download::PARAKEET_TDT_0_6B_V2,
+                &paths.cache_dir,
+            )
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+            println!("Model ready: {}", target.display());
         }
     }
     Ok(())

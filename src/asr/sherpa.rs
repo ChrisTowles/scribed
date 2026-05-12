@@ -6,9 +6,8 @@
 //! by re-running it on the rolling buffer every chunk (see [`crate::asr::driver`]).
 //!
 //! This module compiles only with `--features asr` because sherpa-rs links
-//! against native libraries.
-
-#![cfg(feature = "asr")]
+//! against native libraries. The `#[cfg]` gate lives on the `pub mod sherpa`
+//! declaration in `mod.rs`.
 
 use std::path::{Path, PathBuf};
 

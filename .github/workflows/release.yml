@@ -33,14 +33,17 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libasound2-dev libdbus-1-dev
-      - run: cargo build --release --target ${{ matrix.target }} --no-default-features
+      - run: cargo build --release --target ${{ matrix.target }}
       - name: package
         shell: bash
         run: |
-          mkdir -p dist
-          binary="target/${{ matrix.target }}/release/scribed"
+          mkdir -p dist staging
+          release_dir="target/${{ matrix.target }}/release"
+          cp "$release_dir/scribed" staging/
+          # Ship sherpa-onnx native libs next to the binary; $ORIGIN rpath finds them.
+          find "$release_dir" -maxdepth 1 \( -name '*.so' -o -name '*.so.*' -o -name '*.dylib' \) -exec cp -P {} staging/ \;
           archive="scribed-${{ github.ref_name }}-${{ matrix.target }}.tar.gz"
-          tar czf "dist/$archive" -C "$(dirname "$binary")" "$(basename "$binary")"
+          tar czf "dist/$archive" -C staging .
       - uses: actions/upload-artifact@v4
         with:
           name: dist-${{ matrix.target }}

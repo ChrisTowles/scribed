@@ -14,7 +14,7 @@ In development. The Rust port of [claude-stt](https://github.com/) (Python). Pha
 
 ```bash
 # Build with the ASR engine (downloads sherpa-onnx native libs into target/)
-cargo build --release --features asr
+cargo build --release
 
 # Fetch the Parakeet model bundle (~460 MB, cached at ~/.cache/scribed/)
 ./target/release/scribed fetch-model

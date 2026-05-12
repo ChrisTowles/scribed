@@ -77,11 +77,13 @@ scribed print-config > ~/.config/scribed/config.toml
 ```bash
 git clone <repo>
 cd scribed
-cargo build --release --features asr     # asr feature pulls in sherpa-onnx
+cargo build --release          # default `asr` feature pulls in sherpa-onnx
 ```
 
-The `asr` feature requires the sherpa-onnx native library; sherpa-rs downloads
-prebuilt binaries automatically on first build. For NVIDIA CUDA acceleration:
+The `asr` feature (on by default) requires the sherpa-onnx native library;
+sherpa-rs downloads prebuilt binaries automatically on first build. Pass
+`--no-default-features` for a quick syntax check without the native dep.
+For NVIDIA CUDA acceleration:
 
 ```bash
 cargo build --release --features cuda

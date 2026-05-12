@@ -11,9 +11,9 @@ keywords = ["dictation", "speech-to-text", "asr", "parakeet", "daemon"]
 categories = ["command-line-utilities", "multimedia::audio"]
 
 [features]
-default = []
-# Compile the ASR engine. Off by default so `cargo check` works without the
-# sherpa-onnx native library installed.
+default = ["asr"]
+# Compile the ASR engine. Disable with `--no-default-features` if the
+# sherpa-onnx native library isn't installed (e.g. quick `cargo check`).
 asr = ["dep:sherpa-rs"]
 # Build sherpa-onnx with CUDA execution provider. Requires CUDA 12.x toolkit.
 cuda = ["asr", "sherpa-rs/cuda"]

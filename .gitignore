@@ -1,0 +1,18 @@
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# OS junk
+.DS_Store
+*.swp
+*~
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# Cached model assets (downloaded at runtime)
+/cache/
+*.onnx
+*.tar.bz2

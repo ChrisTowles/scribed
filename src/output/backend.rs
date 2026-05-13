@@ -155,7 +155,10 @@ mod tests {
         // Missing path -> None.
         let missing = dir.path().join("nope");
         std::env::set_var("YDOTOOL_SOCKET", &missing);
-        assert!(ydotool_socket_path().is_none(), "missing file should be None");
+        assert!(
+            ydotool_socket_path().is_none(),
+            "missing file should be None"
+        );
 
         // Regular file -> None.
         let regular = dir.path().join("plain");

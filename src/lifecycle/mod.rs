@@ -386,7 +386,10 @@ fn start_hotkey_listener(
             Some(listener)
         }
         Err(e) => {
-            tracing::warn!(?e, "hotkey listener failed to start; daemon will run without global hotkey");
+            tracing::warn!(
+                ?e,
+                "hotkey listener failed to start; daemon will run without global hotkey"
+            );
             None
         }
     }

@@ -295,6 +295,8 @@ fn run_loop(paths: &Paths, config: &Config) -> crate::Result<()> {
             }
         });
 
+        let _hotkey_listener = start_hotkey_listener(config, state.clone());
+
         let sigint = tokio::signal::ctrl_c();
         let mut sigterm =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -315,6 +317,48 @@ fn run_loop(paths: &Paths, config: &Config) -> crate::Result<()> {
         Ok::<_, crate::Error>(())
     })?;
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn start_hotkey_listener(
+    config: &Config,
+    state: Arc<Mutex<DaemonState>>,
+) -> Option<crate::input::evdev_listener::EvdevListener> {
+    use crate::input::evdev_listener::EvdevListener;
+    use crate::input::{KeyChord, RecordingIntent};
+
+    let chord = match KeyChord::parse(&config.hotkey) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(hotkey = %config.hotkey, ?e, "invalid hotkey; listener disabled");
+            return None;
+        }
+    };
+    let chord_display = chord.to_string();
+    match EvdevListener::start(chord, config.mode, move |intent| {
+        let recording = match intent {
+            RecordingIntent::Start => true,
+            RecordingIntent::Stop => false,
+            RecordingIntent::Toggle => !state.lock().recording,
+        };
+        state.lock().recording = recording;
+        tracing::info!(?intent, recording, "hotkey");
+    }) {
+        Ok(listener) => {
+            tracing::info!(hotkey = %chord_display, "hotkey listener active");
+            Some(listener)
+        }
+        Err(e) => {
+            tracing::warn!(?e, "hotkey listener failed to start; daemon will run without global hotkey");
+            None
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn start_hotkey_listener(_config: &Config, _state: Arc<Mutex<DaemonState>>) -> Option<()> {
+    tracing::warn!("hotkey listener not yet implemented on this platform");
+    None
 }
 
 #[derive(Debug)]

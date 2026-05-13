@@ -54,7 +54,7 @@ fn default_config_dir() -> PathBuf {
     PathBuf::from(".scribed")
 }
 
-fn default_cache_dir() -> PathBuf {
+pub fn default_cache_dir() -> PathBuf {
     if let Some(dirs) = ProjectDirs::from("dev", "", "scribed") {
         return dirs.cache_dir().to_path_buf();
     }

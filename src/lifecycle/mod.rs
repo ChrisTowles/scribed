@@ -238,7 +238,9 @@ fn background_spawn(paths: &Paths) -> crate::Result<()> {
     tracing::info!(pid = child_pid, "spawned background daemon");
 
     // Poll the pid file briefly to confirm the child wrote its identity.
-    let deadline = Instant::now() + Duration::from_secs(3);
+    // Model load takes a few seconds, so we give it more headroom than the
+    // pure-IPC daemon needed.
+    let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
         if let Ok(Some(_)) = pidfile::read(&paths.pid_file) {
             println!("scribed: started (pid {child_pid})");
@@ -256,6 +258,24 @@ fn background_spawn(paths: &Paths) -> crate::Result<()> {
 /// The daemon's main async loop. Owns the control socket and waits for either
 /// a `Stop` command, a SIGTERM/SIGINT, or an internal failure.
 fn run_loop(paths: &Paths, config: &Config) -> crate::Result<()> {
+    #[cfg(feature = "asr")]
+    let runtime: Option<Arc<Mutex<crate::service::Runtime>>> = {
+        let model_dir = paths
+            .cache_dir
+            .join("sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8");
+        match crate::service::Runtime::load(config, model_dir.clone()) {
+            Ok(rt) => Some(Arc::new(Mutex::new(rt))),
+            Err(e) => {
+                tracing::warn!(
+                    ?e,
+                    dir = %model_dir.display(),
+                    "ASR runtime disabled — hotkey will toggle state but no transcription will run. Run `scribed fetch-model` to enable."
+                );
+                None
+            }
+        }
+    };
+
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
@@ -269,6 +289,8 @@ fn run_loop(paths: &Paths, config: &Config) -> crate::Result<()> {
         let handler = Arc::new(IpcHandler {
             state: state.clone(),
             shutdown: shutdown.clone(),
+            #[cfg(feature = "asr")]
+            runtime: runtime.clone(),
         });
 
         let listener = ipc::server::bind(&paths.control_socket)
@@ -295,7 +317,12 @@ fn run_loop(paths: &Paths, config: &Config) -> crate::Result<()> {
             }
         });
 
-        let _hotkey_listener = start_hotkey_listener(config, state.clone());
+        let _hotkey_listener = start_hotkey_listener(
+            config,
+            state.clone(),
+            #[cfg(feature = "asr")]
+            runtime.clone(),
+        );
 
         let sigint = tokio::signal::ctrl_c();
         let mut sigterm =
@@ -323,6 +350,7 @@ fn run_loop(paths: &Paths, config: &Config) -> crate::Result<()> {
 fn start_hotkey_listener(
     config: &Config,
     state: Arc<Mutex<DaemonState>>,
+    #[cfg(feature = "asr")] runtime: Option<Arc<Mutex<crate::service::Runtime>>>,
 ) -> Option<crate::input::evdev_listener::EvdevListener> {
     use crate::input::evdev_listener::EvdevListener;
     use crate::input::{KeyChord, RecordingIntent};
@@ -343,6 +371,15 @@ fn start_hotkey_listener(
         };
         state.lock().recording = recording;
         tracing::info!(?intent, recording, "hotkey");
+        #[cfg(feature = "asr")]
+        if let Some(rt) = &runtime {
+            let mut rt = rt.lock();
+            if recording {
+                rt.start_session();
+            } else {
+                rt.stop_session();
+            }
+        }
     }) {
         Ok(listener) => {
             tracing::info!(hotkey = %chord_display, "hotkey listener active");
@@ -356,7 +393,11 @@ fn start_hotkey_listener(
 }
 
 #[cfg(not(target_os = "linux"))]
-fn start_hotkey_listener(_config: &Config, _state: Arc<Mutex<DaemonState>>) -> Option<()> {
+fn start_hotkey_listener(
+    _config: &Config,
+    _state: Arc<Mutex<DaemonState>>,
+    #[cfg(feature = "asr")] _runtime: Option<Arc<Mutex<crate::service::Runtime>>>,
+) -> Option<()> {
     tracing::warn!("hotkey listener not yet implemented on this platform");
     None
 }
@@ -371,6 +412,8 @@ struct DaemonState {
 struct IpcHandler {
     state: Arc<Mutex<DaemonState>>,
     shutdown: Arc<Notify>,
+    #[cfg(feature = "asr")]
+    runtime: Option<Arc<Mutex<crate::service::Runtime>>>,
 }
 
 impl ipc::server::CommandHandler for IpcHandler {
@@ -394,8 +437,21 @@ impl ipc::server::CommandHandler for IpcHandler {
                     DaemonReply::Ok
                 }
                 DaemonCommand::Toggle => {
-                    let mut s = self.state.lock();
-                    s.recording = !s.recording;
+                    let recording = {
+                        let mut s = self.state.lock();
+                        s.recording = !s.recording;
+                        s.recording
+                    };
+                    #[cfg(feature = "asr")]
+                    if let Some(rt) = &self.runtime {
+                        let mut rt = rt.lock();
+                        if recording {
+                            rt.start_session();
+                        } else {
+                            rt.stop_session();
+                        }
+                    }
+                    let _ = recording;
                     DaemonReply::Ok
                 }
             }

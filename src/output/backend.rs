@@ -41,7 +41,7 @@ pub mod enigo;
 pub mod clipboard;
 
 /// Pick a backend appropriate for the current environment.
-pub fn auto_detect() -> Box<dyn KeyboardSink> {
+pub fn auto_detect() -> Box<dyn KeyboardSink + Send> {
     match select_backend_kind() {
         BackendKind::Ydotool => Box::new(ydotool::YdotoolBackend::new()),
         BackendKind::Enigo => match enigo::EnigoBackend::new() {

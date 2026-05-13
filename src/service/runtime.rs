@@ -3,8 +3,10 @@
 //! The daemon loads one [`Runtime`] at startup (model + backend), then calls
 //! [`Runtime::start_session`] / [`Runtime::stop_session`] every time the user
 //! toggles. Each session captures audio into a buffer on a dedicated thread;
-//! at stop the buffer is sent through the loaded `SherpaTranscriber` and the
-//! resulting text is pushed through the [`KeyboardSink`].
+//! every chunk is fed to a [`StreamingDriver`] which transcribes the rolling
+//! buffer and emits an evolving transcript. The diff between successive
+//! transcripts is pushed through the [`KeyboardSink`] so text appears in the
+//! focused window as the user speaks.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -14,19 +16,20 @@ use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 
-use crate::asr::driver::Transcriber;
+use crate::asr::driver::{DriverConfig, StreamingDriver};
 use crate::asr::sherpa::{ModelBundle, SherpaTranscriber};
-use crate::asr::AsrError;
+use crate::asr::{AsrError, Transcript};
 use crate::audio::{self, AudioChunk, SAMPLE_RATE_HZ};
 use crate::config::Config;
 use crate::output::backend;
-use crate::output::retype::{KeyboardSink, RetypeStep};
+use crate::output::retype::{KeyboardSink, RetypeState};
 
 pub struct Runtime {
     transcriber: Arc<Mutex<SherpaTranscriber>>,
     backend: Arc<Mutex<Box<dyn KeyboardSink + Send>>>,
     input_device: String,
     chunk_samples: usize,
+    driver_config: DriverConfig,
     current_stop: Option<Arc<AtomicBool>>,
 }
 
@@ -47,6 +50,7 @@ impl Runtime {
             backend: Arc::new(Mutex::new(backend)),
             input_device: config.input_device.clone(),
             chunk_samples: config.chunk_samples(SAMPLE_RATE_HZ),
+            driver_config: DriverConfig::from_config(config),
             current_stop: None,
         })
     }
@@ -66,12 +70,14 @@ impl Runtime {
         let backend = self.backend.clone();
         let input_device = self.input_device.clone();
         let chunk_samples = self.chunk_samples;
+        let driver_config = self.driver_config.clone();
         thread::Builder::new()
             .name("scribed-session".into())
             .spawn(move || {
-                record_and_transcribe(
+                record_and_stream(
                     input_device,
                     chunk_samples,
+                    driver_config,
                     stop_thread,
                     transcriber,
                     backend,
@@ -81,9 +87,9 @@ impl Runtime {
         self.current_stop = Some(stop);
     }
 
-    /// Signals the in-flight session to wind down (capture stops, final
-    /// transcription runs, text is typed). Returns immediately; the worker
-    /// thread is detached.
+    /// Signals the in-flight session to wind down (capture stops, pending
+    /// audio is drained through one final inference, the diff is typed).
+    /// Returns immediately; the worker thread is detached.
     pub fn stop_session(&mut self) {
         if let Some(flag) = self.current_stop.take() {
             flag.store(true, Ordering::SeqCst);
@@ -91,9 +97,10 @@ impl Runtime {
     }
 }
 
-fn record_and_transcribe(
+fn record_and_stream(
     input_device: String,
     chunk_samples: usize,
+    driver_config: DriverConfig,
     stop: Arc<AtomicBool>,
     transcriber: Arc<Mutex<SherpaTranscriber>>,
     backend: Arc<Mutex<Box<dyn KeyboardSink + Send>>>,
@@ -121,48 +128,63 @@ fn record_and_transcribe(
         "recording started"
     );
 
-    let mut buffer: Vec<f32> = Vec::new();
+    let mut driver = StreamingDriver::new(driver_config);
+    let mut retype = RetypeState::new();
+
     while !stop.load(Ordering::SeqCst) {
         match rx.recv_timeout(Duration::from_millis(50)) {
-            Ok(chunk) => buffer.extend(chunk),
+            Ok(chunk) => process_chunk(&chunk, &mut driver, &mut retype, &transcriber, &backend),
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
         }
     }
-    while let Ok(chunk) = rx.try_recv() {
-        buffer.extend(chunk);
-    }
+
     drop(stream);
 
-    if buffer.is_empty() {
-        tracing::warn!("recording produced no audio");
-        return;
+    while let Ok(chunk) = rx.try_recv() {
+        process_chunk(&chunk, &mut driver, &mut retype, &transcriber, &backend);
     }
-    let seconds = buffer.len() as f32 / SAMPLE_RATE_HZ as f32;
-    tracing::info!(samples = buffer.len(), seconds, "transcribing");
 
-    let t = Instant::now();
-    let text = {
-        let mut tr = transcriber.lock();
-        match tr.transcribe(&buffer) {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::error!(?e, "transcription failed");
-                return;
-            }
+    let mut tr = transcriber.lock();
+    match driver.finalize(&mut *tr) {
+        Ok(final_transcript) => {
+            drop(tr);
+            apply_transcript(&final_transcript, &mut retype, &backend);
+            tracing::info!(text = %final_transcript.render(), "session finalized");
         }
-    };
-    let elapsed = t.elapsed();
-    let trimmed = text.trim();
-    tracing::info!(?elapsed, chars = trimmed.chars().count(), text = %trimmed, "transcribed");
-    if trimmed.is_empty() {
+        Err(e) => tracing::error!(?e, "finalize failed"),
+    }
+}
+
+fn process_chunk(
+    chunk: &[f32],
+    driver: &mut StreamingDriver,
+    retype: &mut RetypeState,
+    transcriber: &Arc<Mutex<SherpaTranscriber>>,
+    backend: &Arc<Mutex<Box<dyn KeyboardSink + Send>>>,
+) {
+    let mut tr = transcriber.lock();
+    let outcome = driver.ingest(chunk, &mut *tr);
+    drop(tr);
+    match outcome {
+        Ok(Some(transcript)) => apply_transcript(&transcript, retype, backend),
+        Ok(None) => {}
+        Err(e) => tracing::error!(?e, "ingest failed"),
+    }
+}
+
+fn apply_transcript(
+    transcript: &Transcript,
+    retype: &mut RetypeState,
+    backend: &Arc<Mutex<Box<dyn KeyboardSink + Send>>>,
+) {
+    let text = transcript.render();
+    let step = retype.diff(&text);
+    if step.is_noop() {
         return;
     }
     let mut be = backend.lock();
-    if let Err(e) = be.apply(RetypeStep {
-        backspaces: 0,
-        insert: trimmed,
-    }) {
+    if let Err(e) = be.apply(step) {
         tracing::error!(?e, "backend apply failed");
     }
 }

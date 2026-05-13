@@ -53,12 +53,48 @@ pub fn start(paths: &Paths, config: &Config, background: bool) -> crate::Result<
         pidfile::remove(&paths.pid_file)?;
     }
 
+    // Surface environment issues to the terminal before we fork into the
+    // background and the user loses sight of stderr.
+    preflight_warnings(config);
+
     if background {
         background_spawn(paths)?;
     } else {
         run_foreground(paths, config)?;
     }
     Ok(())
+}
+
+/// Prints user-visible warnings to stderr for environment problems that won't
+/// stop the daemon from starting, but will degrade behavior. Called from
+/// [`start`] before the optional fork so the messages reach the user's
+/// terminal, not the daemon log.
+fn preflight_warnings(config: &Config) {
+    use crate::config::OutputMode;
+    use crate::output::backend;
+
+    if backend::is_wayland() {
+        let injection_intended =
+            matches!(config.output_mode, OutputMode::Auto | OutputMode::Injection);
+        let resolved = backend::select_backend_kind();
+        if injection_intended && resolved != backend::BackendKind::Ydotool {
+            let reason = if !backend::ydotool_available() {
+                "`ydotool` binary not found on PATH"
+            } else {
+                "`ydotoold` socket not found (daemon not running)"
+            };
+            eprintln!();
+            eprintln!("warning: Wayland session detected, but {reason}.");
+            eprintln!(
+                "         Dictation will fall back to the {} backend; keystroke",
+                resolved.as_str()
+            );
+            eprintln!("         injection into the focused window will not work.");
+            eprintln!("         To enable injection:");
+            eprintln!("           systemctl --user enable --now ydotoold");
+            eprintln!();
+        }
+    }
 }
 
 /// `scribed stop`.
@@ -95,6 +131,10 @@ pub fn status(paths: &Paths, config: &Config) -> crate::Result<()> {
     println!("  hotkey     : {}", config.hotkey);
     println!("  mode       : {:?}", config.mode);
     println!("  model      : {}", config.model);
+    println!(
+        "  output     : {}",
+        crate::output::backend::select_backend_kind().as_str()
+    );
 
     match pidfile::read(&paths.pid_file) {
         Ok(Some(record)) => match liveness::classify(record.pid) {

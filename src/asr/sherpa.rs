@@ -1,31 +1,22 @@
-//! Sherpa-onnx Parakeet-TDT-0.6B-v2 backend.
+//! Streaming sherpa-onnx backend.
 //!
-//! Implements [`Transcriber`] by wrapping `sherpa_rs::transducer::TransducerRecognizer`.
-//! The recognizer is "offline" in sherpa-onnx terminology — meaning it
-//! transcribes a complete audio buffer in one shot. We get the streaming feel
-//! by re-running it on the rolling buffer every chunk (see [`crate::asr::driver`]).
-//!
-//! This module compiles only with `--features asr` because sherpa-rs links
-//! against native libraries. The `#[cfg]` gate lives on the `pub mod sherpa`
-//! declaration in `mod.rs`.
+//! RAII wrappers around the `SherpaOnnxOnlineRecognizer` C API. `sherpa-rs`
+//! 0.6 has no high-level Rust binding for the online recognizer, so we call
+//! `sherpa_rs_sys` directly (re-exported via the `sherpa-rs/sys` feature).
 
+use std::ffi::{CStr, CString};
 use std::path::{Path, PathBuf};
 
-use sherpa_rs::transducer::{TransducerConfig, TransducerRecognizer};
+use sherpa_rs::sherpa_rs_sys as sys;
 
-use crate::asr::{driver::Transcriber, AsrError};
-use crate::audio::SAMPLE_RATE_HZ;
+use crate::asr::driver::{StreamingTranscriber, StreamingUpdate};
+use crate::asr::{AsrError, EndpointRules};
+use crate::audio::{SAMPLE_RATE_HZ_I32};
 
-/// Where on disk the Parakeet bundle lives. The bundle is the four-file
-/// directory sherpa-onnx ships:
-///
-/// ```text
-/// sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8/
-///   ├── encoder.onnx
-///   ├── decoder.onnx
-///   ├── joiner.onnx
-///   └── tokens.txt
-/// ```
+/// File layout for a sherpa-onnx streaming Zipformer transducer bundle.
+/// `from_dir` auto-detects `encoder*.onnx` / `decoder*.onnx` / `joiner*.onnx`
+/// (preferring `.int8.onnx`), so it works for both canonical-named bundles
+/// and k2-fsa's epoch-suffixed releases.
 #[derive(Debug, Clone)]
 pub struct ModelBundle {
     pub encoder: PathBuf,
@@ -35,16 +26,11 @@ pub struct ModelBundle {
 }
 
 impl ModelBundle {
-    /// Resolve the bundle under `dir`. Auto-detects whether the directory
-    /// contains the `*.int8.onnx` (quantized) variant or the `*.onnx`
-    /// (fp32/fp16) variant.
     pub fn from_dir(dir: &Path) -> Self {
-        let int8 = dir.join("encoder.int8.onnx").exists();
-        let suffix = if int8 { ".int8.onnx" } else { ".onnx" };
         Self {
-            encoder: dir.join(format!("encoder{suffix}")),
-            decoder: dir.join(format!("decoder{suffix}")),
-            joiner: dir.join(format!("joiner{suffix}")),
+            encoder: find_onnx(dir, "encoder"),
+            decoder: find_onnx(dir, "decoder"),
+            joiner: find_onnx(dir, "joiner"),
             tokens: dir.join("tokens.txt"),
         }
     }
@@ -67,45 +53,280 @@ impl ModelBundle {
     }
 }
 
-/// A `Transcriber` backed by a sherpa-onnx offline Parakeet recognizer.
-pub struct SherpaTranscriber {
-    inner: TransducerRecognizer,
+/// Pick the best matching `<role>*.onnx` file in `dir`. Quantized
+/// (`.int8.onnx`) wins when both are present.
+fn find_onnx(dir: &Path, role: &str) -> PathBuf {
+    let mut quantized: Option<PathBuf> = None;
+    let mut plain: Option<PathBuf> = None;
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
+            if !name.starts_with(role) {
+                continue;
+            }
+            if name.ends_with(".int8.onnx") {
+                quantized = Some(path);
+            } else if name.ends_with(".onnx") {
+                plain = Some(path);
+            }
+        }
+    }
+    quantized
+        .or(plain)
+        // Fall back to the canonical name so `validate()` produces a useful
+        // error message rather than silently pointing at the directory.
+        .unwrap_or_else(|| dir.join(format!("{role}.onnx")))
 }
 
-impl SherpaTranscriber {
-    /// Load the recognizer. May take a few seconds.
-    ///
-    /// `provider` is a sherpa-onnx execution-provider string. Common values:
-    /// `"cpu"` (default), `"cuda"`, `"coreml"`. If the provider isn't compiled
-    /// in, sherpa-onnx falls back to CPU.
-    pub fn load(bundle: &ModelBundle, provider: &str, num_threads: i32) -> Result<Self, AsrError> {
+/// Load-time configuration for [`SherpaStreamingTranscriber`].
+#[derive(Debug, Clone)]
+pub struct StreamingConfig {
+    pub provider: String,
+    pub num_threads: i32,
+    pub endpoint_rules: EndpointRules,
+}
+
+impl Default for StreamingConfig {
+    fn default() -> Self {
+        Self {
+            provider: "cpu".to_string(),
+            num_threads: 1,
+            endpoint_rules: EndpointRules::default(),
+        }
+    }
+}
+
+/// RAII handle: holds the heavy ONNX session. One recognizer mints many streams.
+struct OnlineRecognizer {
+    ptr: *const sys::SherpaOnnxOnlineRecognizer,
+}
+
+// Safety: reentrancy-safe as long as a given stream is touched from one
+// thread at a time, which scribed honors (one `&mut SherpaStreamingTranscriber`
+// per session thread).
+unsafe impl Send for OnlineRecognizer {}
+unsafe impl Sync for OnlineRecognizer {}
+
+impl Drop for OnlineRecognizer {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            unsafe { sys::SherpaOnnxDestroyOnlineRecognizer(self.ptr) };
+        }
+    }
+}
+
+/// RAII handle to a sherpa-onnx online stream (one per utterance).
+struct OnlineStream {
+    ptr: *const sys::SherpaOnnxOnlineStream,
+}
+
+unsafe impl Send for OnlineStream {}
+
+impl Drop for OnlineStream {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            unsafe { sys::SherpaOnnxDestroyOnlineStream(self.ptr) };
+        }
+    }
+}
+
+/// Streaming Zipformer transducer backed by sherpa-onnx. Implements
+/// [`StreamingTranscriber`].
+//
+// Field order matters: Rust drops fields in declaration order, and sherpa-onnx
+// requires every OnlineStream to be destroyed BEFORE the OnlineRecognizer that
+// minted it. `stream` must precede `recognizer` here.
+pub struct SherpaStreamingTranscriber {
+    stream: Option<OnlineStream>,
+    recognizer: OnlineRecognizer,
+    /// Last hypothesis text as raw C bytes. Sherpa may emit non-UTF-8 byte
+    /// sequences (e.g. CJK punctuation models); comparing raw bytes against
+    /// the next poll's `CStr::to_bytes()` keeps the dedup cache correct
+    /// regardless of how UTF-8-lossy decoding rewrites the string we expose.
+    last_partial_bytes: Vec<u8>,
+}
+
+impl SherpaStreamingTranscriber {
+    pub fn load(bundle: &ModelBundle, config: &StreamingConfig) -> Result<Self, AsrError> {
         bundle.validate()?;
-        let config = TransducerConfig {
-            encoder: bundle.encoder.to_string_lossy().into_owned(),
-            decoder: bundle.decoder.to_string_lossy().into_owned(),
-            joiner: bundle.joiner.to_string_lossy().into_owned(),
-            tokens: bundle.tokens.to_string_lossy().into_owned(),
-            // The Parakeet bundle's README specifies "nemo_transducer" as the
-            // model type so sherpa-onnx applies the correct decoding path.
-            model_type: "nemo_transducer".to_string(),
-            num_threads,
-            sample_rate: SAMPLE_RATE_HZ as i32,
-            feature_dim: 80,
-            decoding_method: "greedy_search".to_string(),
-            provider: Some(provider.to_string()),
-            ..Default::default()
+
+        // CStrings must live until SherpaOnnxCreateOnlineRecognizer returns —
+        // sherpa-onnx copies them into C++ std::string internally.
+        let encoder = path_cstring(&bundle.encoder)?;
+        let decoder = path_cstring(&bundle.decoder)?;
+        let joiner = path_cstring(&bundle.joiner)?;
+        let tokens = path_cstring(&bundle.tokens)?;
+        let provider = CString::new(config.provider.as_str())
+            .map_err(|e| AsrError::Load(format!("provider has NUL: {e}")))?;
+        let decoding_method = CString::new("greedy_search").unwrap();
+
+        // Zero-init: pointer fields default to NULL, ints to 0, both meaning
+        // "unset" in sherpa-onnx. We overwrite only what we need.
+        let mut cfg: sys::SherpaOnnxOnlineRecognizerConfig = unsafe { std::mem::zeroed() };
+        cfg.feat_config.sample_rate = SAMPLE_RATE_HZ_I32;
+        cfg.feat_config.feature_dim = 80;
+        cfg.model_config.transducer.encoder = encoder.as_ptr();
+        cfg.model_config.transducer.decoder = decoder.as_ptr();
+        cfg.model_config.transducer.joiner = joiner.as_ptr();
+        cfg.model_config.tokens = tokens.as_ptr();
+        cfg.model_config.num_threads = config.num_threads;
+        cfg.model_config.provider = provider.as_ptr();
+        // model_type left NULL: sherpa-onnx reads it from the encoder.onnx metadata.
+        cfg.decoding_method = decoding_method.as_ptr();
+        cfg.max_active_paths = 4;
+        cfg.enable_endpoint = 1;
+        cfg.rule1_min_trailing_silence = config.endpoint_rules.rule1_min_trailing_silence;
+        cfg.rule2_min_trailing_silence = config.endpoint_rules.rule2_min_trailing_silence;
+        cfg.rule3_min_utterance_length = config.endpoint_rules.rule3_max_utterance_seconds;
+
+        let ptr = unsafe { sys::SherpaOnnxCreateOnlineRecognizer(&cfg) };
+        if ptr.is_null() {
+            return Err(AsrError::Load(
+                "SherpaOnnxCreateOnlineRecognizer returned null (check model paths and provider)"
+                    .to_string(),
+            ));
+        }
+
+        let mut me = Self {
+            stream: None,
+            recognizer: OnlineRecognizer { ptr },
+            last_partial_bytes: Vec::new(),
         };
-        let inner =
-            TransducerRecognizer::new(config).map_err(|e| AsrError::Load(format!("{e:?}")))?;
-        Ok(Self { inner })
+        me.open_stream()?;
+        Ok(me)
+    }
+
+    fn open_stream(&mut self) -> Result<(), AsrError> {
+        let s = unsafe { sys::SherpaOnnxCreateOnlineStream(self.recognizer.ptr) };
+        if s.is_null() {
+            return Err(AsrError::Inference(
+                "SherpaOnnxCreateOnlineStream returned null".to_string(),
+            ));
+        }
+        self.stream = Some(OnlineStream { ptr: s });
+        self.last_partial_bytes.clear();
+        Ok(())
+    }
+
+    fn stream_ptr(&self) -> Result<*const sys::SherpaOnnxOnlineStream, AsrError> {
+        self.stream
+            .as_ref()
+            .map(|s| s.ptr)
+            .ok_or(AsrError::NotLoaded)
+    }
+
+    fn poll_once(&mut self) -> Result<StreamingUpdate, AsrError> {
+        let rec = self.recognizer.ptr;
+        let stream = self.stream_ptr()?;
+
+        let mut decoded = false;
+        while unsafe { sys::SherpaOnnxIsOnlineStreamReady(rec, stream) } != 0 {
+            unsafe { sys::SherpaOnnxDecodeOnlineStream(rec, stream) };
+            decoded = true;
+        }
+
+        let is_endpoint = unsafe { sys::SherpaOnnxOnlineStreamIsEndpoint(rec, stream) } != 0;
+
+        if is_endpoint {
+            let text = self.with_result(|bytes| String::from_utf8_lossy(bytes).into_owned())?;
+            // Sherpa requires Reset after consuming an endpoint, otherwise
+            // the next decode pass keeps emitting the same committed text.
+            unsafe { sys::SherpaOnnxOnlineStreamReset(rec, stream) };
+            self.last_partial_bytes.clear();
+            return Ok(StreamingUpdate::Endpoint(text));
+        }
+
+        if !decoded {
+            return Ok(StreamingUpdate::Idle);
+        }
+
+        // Compare raw bytes against last_partial_bytes inside the FFI lease so
+        // we only allocate when the hypothesis actually changed. Sherpa emits
+        // the same text between frames whenever a decode pass produces no new
+        // tokens; this skip dominates poll cost at ~10 Hz.
+        let last_bytes = self.last_partial_bytes.as_slice();
+        let changed: Option<(String, Vec<u8>)> = self.with_result(|bytes| {
+            if bytes == last_bytes {
+                None
+            } else {
+                Some((String::from_utf8_lossy(bytes).into_owned(), bytes.to_vec()))
+            }
+        })?;
+        match changed {
+            None => Ok(StreamingUpdate::Idle),
+            Some((text, bytes)) => {
+                self.last_partial_bytes = bytes;
+                Ok(StreamingUpdate::Partial(text))
+            }
+        }
+    }
+
+    /// Acquire the current recognizer result, hand its UTF-8 bytes to `f`,
+    /// and free the C-side handle whether `f` panics or returns. `f` receives
+    /// an empty slice when the result or its text pointer is null.
+    fn with_result<T>(&self, f: impl FnOnce(&[u8]) -> T) -> Result<T, AsrError> {
+        let rec = self.recognizer.ptr;
+        let stream = self.stream_ptr()?;
+        let result = unsafe { sys::SherpaOnnxGetOnlineStreamResult(rec, stream) };
+        if result.is_null() {
+            return Ok(f(&[]));
+        }
+        // SAFETY: result is non-null and owned by us until DestroyOnlineRecognizerResult.
+        let out = unsafe {
+            let text_ptr = (*result).text;
+            let bytes: &[u8] = if text_ptr.is_null() {
+                &[]
+            } else {
+                CStr::from_ptr(text_ptr).to_bytes()
+            };
+            f(bytes)
+        };
+        unsafe { sys::SherpaOnnxDestroyOnlineRecognizerResult(result) };
+        Ok(out)
     }
 }
 
-impl Transcriber for SherpaTranscriber {
-    fn transcribe(&mut self, audio: &[f32]) -> Result<String, AsrError> {
-        let text = self.inner.transcribe(SAMPLE_RATE_HZ, audio);
-        Ok(text)
+impl StreamingTranscriber for SherpaStreamingTranscriber {
+    fn accept_waveform(&mut self, samples: &[f32]) -> Result<(), AsrError> {
+        if samples.is_empty() {
+            return Ok(());
+        }
+        let stream = self.stream_ptr()?;
+        unsafe {
+            sys::SherpaOnnxOnlineStreamAcceptWaveform(
+                stream,
+                SAMPLE_RATE_HZ_I32,
+                samples.as_ptr(),
+                samples.len() as i32,
+            );
+        }
+        Ok(())
     }
+
+    fn poll(&mut self) -> Result<StreamingUpdate, AsrError> {
+        self.poll_once()
+    }
+
+    fn input_finished(&mut self) -> Result<(), AsrError> {
+        let stream = self.stream_ptr()?;
+        unsafe { sys::SherpaOnnxOnlineStreamInputFinished(stream) };
+        Ok(())
+    }
+
+    fn reset(&mut self) -> Result<(), AsrError> {
+        // Destroy + recreate the stream rather than calling OnlineStreamReset:
+        // also flushes any feature frames the previous stream had queued.
+        self.stream = None;
+        self.open_stream()
+    }
+}
+
+fn path_cstring(p: &Path) -> Result<CString, AsrError> {
+    let s = p
+        .to_str()
+        .ok_or_else(|| AsrError::Load(format!("non-UTF-8 path: {}", p.display())))?;
+    CString::new(s).map_err(|e| AsrError::Load(format!("path has NUL: {e}")))
 }
 
 #[cfg(test)]
@@ -117,6 +338,9 @@ mod tests {
     #[test]
     fn from_dir_falls_back_to_plain_onnx_when_no_int8() {
         let dir = tempdir().unwrap();
+        fs::write(dir.path().join("encoder.onnx"), b"stub").unwrap();
+        fs::write(dir.path().join("decoder.onnx"), b"stub").unwrap();
+        fs::write(dir.path().join("joiner.onnx"), b"stub").unwrap();
         let b = ModelBundle::from_dir(dir.path());
         assert_eq!(b.encoder, dir.path().join("encoder.onnx"));
         assert_eq!(b.tokens, dir.path().join("tokens.txt"));
@@ -125,11 +349,40 @@ mod tests {
     #[test]
     fn from_dir_picks_int8_when_present() {
         let dir = tempdir().unwrap();
+        fs::write(dir.path().join("encoder.onnx"), b"stub").unwrap();
         fs::write(dir.path().join("encoder.int8.onnx"), b"stub").unwrap();
+        fs::write(dir.path().join("decoder.int8.onnx"), b"stub").unwrap();
+        fs::write(dir.path().join("joiner.int8.onnx"), b"stub").unwrap();
         let b = ModelBundle::from_dir(dir.path());
         assert_eq!(b.encoder, dir.path().join("encoder.int8.onnx"));
         assert_eq!(b.decoder, dir.path().join("decoder.int8.onnx"));
         assert_eq!(b.joiner, dir.path().join("joiner.int8.onnx"));
+    }
+
+    #[test]
+    fn from_dir_matches_long_filenames() {
+        // k2-fsa publishes models with descriptive filenames like
+        // `encoder-epoch-99-avg-1-chunk-16-left-128.onnx`.
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("encoder-epoch-99-avg-1-chunk-16-left-128.onnx"),
+            b"stub",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("decoder-epoch-99-avg-1-chunk-16-left-128.onnx"),
+            b"stub",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("joiner-epoch-99-avg-1-chunk-16-left-128.onnx"),
+            b"stub",
+        )
+        .unwrap();
+        let b = ModelBundle::from_dir(dir.path());
+        assert!(b.encoder.file_name().unwrap().to_str().unwrap().starts_with("encoder-"));
+        assert!(b.decoder.file_name().unwrap().to_str().unwrap().starts_with("decoder-"));
+        assert!(b.joiner.file_name().unwrap().to_str().unwrap().starts_with("joiner-"));
     }
 
     #[test]

@@ -12,6 +12,8 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::asr::EndpointRules;
+
 /// How the hotkey is interpreted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -46,25 +48,28 @@ pub struct Config {
     pub hotkey: String,
     /// Trigger mode.
     pub mode: TriggerMode,
-    /// ASR model identifier (engine-specific).
-    pub model: String,
     /// Optional substring matched against the cpal input device name.
     /// Empty string means "default device".
     pub input_device: String,
-    /// Audio chunk size in milliseconds. Clamp: [80, 2000].
+    /// Audio chunk size in milliseconds. Clamp: [40, 2000]. Smaller chunks
+    /// give the streaming recognizer tighter latency feedback at the cost of
+    /// slightly more FFI overhead — 120 ms is a good middle ground.
     pub chunk_ms: u32,
-    /// Rolling buffer length in seconds. Clamp: [1.0, 60.0].
-    pub context_seconds: f32,
-    /// Silence gate threshold in dBFS. Clamp: [-120.0, 0.0].
-    pub silence_threshold_dbfs: f32,
-    /// After this much consecutive silence, freeze the current pass into a
-    /// committed segment and clear the rolling buffer. Clamp: [0.1, 10.0].
-    pub silence_reset_seconds: f32,
     /// Hard ceiling on a single recording session. Clamp: [10, 3600].
     pub max_recording_seconds: u32,
     /// Auto-stop after this many seconds without new transcript text.
     /// 0 disables the timer. Clamp: [0, 3600].
     pub silence_auto_stop_seconds: u32,
+    /// Endpoint rule 1: seconds of trailing silence required to fire an
+    /// endpoint when nothing has been decoded yet. Clamp: [0.1, 60.0].
+    pub endpoint_rule1_silence_seconds: f32,
+    /// Endpoint rule 2: seconds of trailing silence required after non-blank
+    /// tokens have been decoded. The primary "user paused" trigger.
+    /// Clamp: [0.1, 60.0].
+    pub endpoint_rule2_silence_seconds: f32,
+    /// Endpoint rule 3: hard ceiling on a single utterance in seconds.
+    /// Clamp: [1.0, 600.0].
+    pub endpoint_rule3_max_utterance_seconds: f32,
     /// Output strategy.
     pub output_mode: OutputMode,
     /// Play start/stop/warning sounds.
@@ -81,14 +86,13 @@ impl Default for Config {
         Self {
             hotkey: "ctrl+shift+space".to_string(),
             mode: TriggerMode::Toggle,
-            model: "nvidia/parakeet-tdt-0.6b-v2".to_string(),
             input_device: String::new(),
-            chunk_ms: 320,
-            context_seconds: 30.0,
-            silence_threshold_dbfs: -32.0,
-            silence_reset_seconds: 1.5,
+            chunk_ms: 120,
             max_recording_seconds: 300,
             silence_auto_stop_seconds: 60,
+            endpoint_rule1_silence_seconds: 2.4,
+            endpoint_rule2_silence_seconds: 1.0,
+            endpoint_rule3_max_utterance_seconds: 20.0,
             output_mode: OutputMode::Auto,
             sound_effects: true,
             soft_newlines: true,
@@ -131,13 +135,16 @@ pub enum ConfigError {
 
 impl Config {
     /// Load from a TOML file, or return defaults if the file does not exist.
-    /// Sanitizes the result before returning.
+    /// Sanitizes the result before returning. Emits a `tracing::warn!` line for
+    /// each stale field name found in the file so a user upgrading from an
+    /// older scribed knows their previously-tuned values are no longer applied.
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
         let cfg = if path.exists() {
             let bytes = fs::read_to_string(path).map_err(|source| ConfigError::Read {
                 path: path.display().to_string(),
                 source,
             })?;
+            warn_on_stale_keys(&bytes, path);
             let file: ConfigFile = toml::from_str(&bytes)?;
             file.scribed
         } else {
@@ -170,22 +177,20 @@ impl Config {
         Ok(())
     }
 
-    /// Clamp numeric fields to safe ranges, mirroring claude-stt's `validate()`.
-    /// Out-of-range values are silently corrected; we don't fail-closed because
-    /// the user's typo on a single field shouldn't lock them out of dictation.
+    /// Clamp numeric fields to safe ranges. Out-of-range values are silently
+    /// corrected; we don't fail-closed because the user's typo on a single
+    /// field shouldn't lock them out of dictation.
     pub fn sanitize(mut self) -> Self {
-        self.chunk_ms = self.chunk_ms.clamp(80, 2000);
-        self.context_seconds = clamp_f32(self.context_seconds, 1.0, 60.0);
-        self.silence_threshold_dbfs = clamp_f32(self.silence_threshold_dbfs, -120.0, 0.0);
-        self.silence_reset_seconds = clamp_f32(self.silence_reset_seconds, 0.1, 10.0);
+        self.chunk_ms = self.chunk_ms.clamp(40, 2000);
         self.max_recording_seconds = self.max_recording_seconds.clamp(10, 3600);
         self.silence_auto_stop_seconds = self.silence_auto_stop_seconds.min(3600);
+        self.endpoint_rule1_silence_seconds =
+            clamp_f32(self.endpoint_rule1_silence_seconds, 0.1, 60.0);
+        self.endpoint_rule2_silence_seconds =
+            clamp_f32(self.endpoint_rule2_silence_seconds, 0.1, 60.0);
+        self.endpoint_rule3_max_utterance_seconds =
+            clamp_f32(self.endpoint_rule3_max_utterance_seconds, 5.0, 600.0);
         self
-    }
-
-    /// Convenience: the rolling-buffer capacity in samples.
-    pub fn rolling_buffer_samples(&self, sample_rate_hz: u32) -> usize {
-        (self.context_seconds * sample_rate_hz as f32) as usize
     }
 
     /// Convenience: the chunk size in samples.
@@ -193,9 +198,54 @@ impl Config {
         (self.chunk_ms as f32 / 1000.0 * sample_rate_hz as f32) as usize
     }
 
-    /// Convenience: number of consecutive silent chunks that trigger a reset.
-    pub fn silence_reset_chunks(&self) -> u32 {
-        ((self.silence_reset_seconds * 1000.0) / self.chunk_ms as f32).ceil() as u32
+    /// Materialize the endpoint-rule values for the sherpa-onnx recognizer.
+    pub fn endpoint_rules(&self) -> EndpointRules {
+        EndpointRules {
+            rule1_min_trailing_silence: self.endpoint_rule1_silence_seconds,
+            rule2_min_trailing_silence: self.endpoint_rule2_silence_seconds,
+            rule3_max_utterance_seconds: self.endpoint_rule3_max_utterance_seconds,
+        }
+    }
+}
+
+/// Fields that previous scribed releases honored but the streaming pipeline no
+/// longer reads. We don't error on them (serde silently ignores unknown keys)
+/// but we warn so an upgrading user knows their tuning has been dropped.
+const STALE_SCRIBED_KEYS: &[(&str, &str)] = &[
+    (
+        "silence_threshold_dbfs",
+        "energy-based silence gate removed; endpoint detection now lives inside sherpa-onnx (see endpoint_rule1/2/3_*)",
+    ),
+    (
+        "silence_reset_seconds",
+        "replaced by endpoint_rule2_silence_seconds",
+    ),
+    (
+        "context_seconds",
+        "rolling buffer removed; the streaming recognizer holds its own context",
+    ),
+    (
+        "model",
+        "model selection is now driven by the cached bundle directory; this field no longer has any effect",
+    ),
+];
+
+fn warn_on_stale_keys(raw_toml: &str, path: &Path) {
+    let Ok(table) = raw_toml.parse::<toml::Table>() else {
+        return; // a real parse error will surface from from_str below
+    };
+    let Some(scribed) = table.get("scribed").and_then(|v| v.as_table()) else {
+        return;
+    };
+    for (key, why) in STALE_SCRIBED_KEYS {
+        if scribed.contains_key(*key) {
+            tracing::warn!(
+                config = %path.display(),
+                key = %key,
+                hint = %why,
+                "config key is obsolete and ignored — remove it from your config to silence this warning"
+            );
+        }
     }
 }
 
@@ -216,14 +266,10 @@ mod tests {
         let c = Config::default();
         assert_eq!(c.hotkey, "ctrl+shift+space");
         assert_eq!(c.mode, TriggerMode::Toggle);
-        assert_eq!(c.chunk_ms, 320);
-        assert_eq!(c.context_seconds, 30.0);
-        // -32 dBFS rejects typical room ambient (-40 to -50 dBFS) without
-        // clipping normal speech (-15 to -25 dBFS at a close mic). Diverges
-        // from the Python claude_stt default of -45 dBFS, which let too much
-        // background noise through and made the model hallucinate filler text.
-        assert_eq!(c.silence_threshold_dbfs, -32.0);
-        assert_eq!(c.silence_reset_seconds, 1.5);
+        assert_eq!(c.chunk_ms, 120);
+        assert_eq!(c.endpoint_rule1_silence_seconds, 2.4);
+        assert_eq!(c.endpoint_rule2_silence_seconds, 1.0);
+        assert_eq!(c.endpoint_rule3_max_utterance_seconds, 20.0);
         assert_eq!(c.max_recording_seconds, 300);
         assert_eq!(c.silence_auto_stop_seconds, 60);
         assert!(c.sound_effects);
@@ -235,28 +281,65 @@ mod tests {
     fn sanitize_clamps_out_of_range_values() {
         let c = Config {
             chunk_ms: 10,
-            context_seconds: 500.0,
-            silence_threshold_dbfs: 10.0,
-            silence_reset_seconds: -1.0,
+            endpoint_rule1_silence_seconds: -1.0,
+            endpoint_rule2_silence_seconds: 9999.0,
+            endpoint_rule3_max_utterance_seconds: 0.0,
             max_recording_seconds: 0,
             ..Config::default()
         }
         .sanitize();
-        assert_eq!(c.chunk_ms, 80);
-        assert_eq!(c.context_seconds, 60.0);
-        assert_eq!(c.silence_threshold_dbfs, 0.0);
-        assert_eq!(c.silence_reset_seconds, 0.1);
+        assert_eq!(c.chunk_ms, 40);
+        assert_eq!(c.endpoint_rule1_silence_seconds, 0.1);
+        assert_eq!(c.endpoint_rule2_silence_seconds, 60.0);
+        assert_eq!(c.endpoint_rule3_max_utterance_seconds, 5.0);
         assert_eq!(c.max_recording_seconds, 10);
     }
 
     #[test]
     fn sanitize_handles_nan() {
         let c = Config {
-            context_seconds: f32::NAN,
+            endpoint_rule1_silence_seconds: f32::NAN,
             ..Config::default()
         }
         .sanitize();
-        assert_eq!(c.context_seconds, 1.0);
+        assert_eq!(c.endpoint_rule1_silence_seconds, 0.1);
+    }
+
+    #[test]
+    fn sanitize_handles_nan_on_every_endpoint_rule() {
+        let c = Config {
+            endpoint_rule1_silence_seconds: f32::NAN,
+            endpoint_rule2_silence_seconds: f32::NAN,
+            endpoint_rule3_max_utterance_seconds: f32::NAN,
+            ..Config::default()
+        }
+        .sanitize();
+        assert_eq!(c.endpoint_rule1_silence_seconds, 0.1, "rule1 floor");
+        assert_eq!(c.endpoint_rule2_silence_seconds, 0.1, "rule2 floor");
+        assert_eq!(c.endpoint_rule3_max_utterance_seconds, 5.0, "rule3 floor");
+    }
+
+    #[test]
+    fn load_warns_on_stale_keys_but_still_succeeds() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("legacy.toml");
+        fs::write(
+            &path,
+            r#"
+[scribed]
+hotkey = "ctrl+shift+space"
+silence_threshold_dbfs = -45.0
+silence_reset_seconds = 1.5
+context_seconds = 30.0
+model = "nvidia/parakeet-tdt-0.6b-v2"
+"#,
+        )
+        .unwrap();
+        // No assertion on the warn output (it goes through tracing); the
+        // contract here is "load succeeds, stale keys are ignored, defaults apply".
+        let c = Config::load(&path).unwrap();
+        assert_eq!(c.hotkey, "ctrl+shift+space");
+        assert_eq!(c.endpoint_rule3_max_utterance_seconds, 20.0);
     }
 
     #[test]
@@ -290,21 +373,24 @@ mod tests {
     }
 
     #[test]
-    fn rolling_buffer_samples_uses_context_seconds() {
-        let c = Config::default();
-        assert_eq!(c.rolling_buffer_samples(16_000), 480_000);
-    }
-
-    #[test]
     fn chunk_samples_uses_chunk_ms() {
         let c = Config::default();
-        assert_eq!(c.chunk_samples(16_000), 5_120);
+        // 120 ms * 16 kHz = 1920 samples.
+        assert_eq!(c.chunk_samples(16_000), 1_920);
     }
 
     #[test]
-    fn silence_reset_chunks_rounds_up() {
-        // default: 1.5s / 320ms = 4.6875 -> ceil = 5
-        assert_eq!(Config::default().silence_reset_chunks(), 5);
+    fn endpoint_rules_round_trip_to_engine_struct() {
+        let c = Config {
+            endpoint_rule1_silence_seconds: 3.0,
+            endpoint_rule2_silence_seconds: 0.7,
+            endpoint_rule3_max_utterance_seconds: 30.0,
+            ..Config::default()
+        };
+        let rules = c.endpoint_rules();
+        assert_eq!(rules.rule1_min_trailing_silence, 3.0);
+        assert_eq!(rules.rule2_min_trailing_silence, 0.7);
+        assert_eq!(rules.rule3_max_utterance_seconds, 30.0);
     }
 
     #[test]

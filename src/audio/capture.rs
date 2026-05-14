@@ -6,6 +6,7 @@
 //! 16 kHz before sending. Conversion is naive nearest-neighbour resampling —
 //! adequate for ASR input where small fidelity loss is invisible.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use cpal::traits::{DeviceTrait, StreamTrait};
@@ -18,11 +19,26 @@ use super::{device::ResolvedInput, AudioError, SAMPLE_RATE_HZ};
 pub type AudioChunk = Vec<f32>;
 
 /// Owns a live cpal stream. When dropped, the stream stops.
+///
+/// `error_flag` is set by the cpal error callback whenever the underlying
+/// device reports a fatal condition (USB unplug, sample-rate mismatch, ALSA
+/// xrun cascade). The session loop polls it so a dead capture stream stops
+/// the session promptly instead of spinning on `recv_timeout` until cpal
+/// eventually drops the sender.
 pub struct CaptureStream {
     _stream: cpal::Stream,
     pub device_name: String,
     pub native_sample_rate: u32,
     pub native_channels: u16,
+    error_flag: Arc<AtomicBool>,
+}
+
+impl CaptureStream {
+    /// True if cpal's error callback has reported a fatal condition. Sticky
+    /// once set — caller should drop the stream and rebuild.
+    pub fn errored(&self) -> bool {
+        self.error_flag.load(Ordering::SeqCst)
+    }
 }
 
 /// Start a capture stream. Audio frames are accumulated until at least
@@ -44,7 +60,12 @@ pub fn start(
     let stream_config: cpal::StreamConfig = config.into();
 
     let accumulator: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::with_capacity(chunk_samples)));
-    let err_fn = |err| tracing::error!("cpal stream error: {err}");
+    let error_flag = Arc::new(AtomicBool::new(false));
+    let err_flag_for_cb = error_flag.clone();
+    let err_fn = move |err| {
+        tracing::error!("cpal stream error: {err}");
+        err_flag_for_cb.store(true, Ordering::SeqCst);
+    };
 
     let stream = match sample_format {
         cpal::SampleFormat::F32 => {
@@ -108,6 +129,7 @@ pub fn start(
         device_name: input.name,
         native_sample_rate,
         native_channels,
+        error_flag,
     })
 }
 

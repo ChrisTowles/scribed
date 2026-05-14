@@ -1,22 +1,19 @@
-//! Audio bounded context — capture, DSP, rolling buffer.
-//!
-//! Phase 2 lands the cpal stream + ring buffer; Phase 1 ships the error type
-//! and the DSP primitives (`rms_dbfs`) used by tests in other modules.
+//! Audio bounded context — capture, DSP, device resolution.
 
 use thiserror::Error;
 
 pub mod capture;
 pub mod device;
 pub mod dsp;
-pub mod rolling;
 
 pub use capture::{AudioChunk, CaptureStream};
 pub use device::{list_names as list_device_names, resolve as resolve_device, ResolvedInput};
 pub use dsp::rms_dbfs;
-pub use rolling::RollingBuffer;
 
-/// Canonical sample rate. Parakeet's encoder is trained on 16 kHz mono.
+/// Canonical sample rate. Every streaming ASR model scribed targets is
+/// trained on 16 kHz mono.
 pub const SAMPLE_RATE_HZ: u32 = 16_000;
+pub const SAMPLE_RATE_HZ_I32: i32 = SAMPLE_RATE_HZ as i32;
 
 #[derive(Debug, Error)]
 pub enum AudioError {

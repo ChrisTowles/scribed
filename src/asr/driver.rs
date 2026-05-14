@@ -1,317 +1,378 @@
-//! The streaming driver — engine-agnostic logic that turns a stream of audio
-//! chunks into evolving transcripts.
-//!
-//! Mirrors the rolling-buffer algorithm in `claude_stt/engines/nemo.py:174-253`.
-//! Every chunk:
-//!
-//! 1. Compute energy. If below `silence_threshold_dbfs`, increment the silent
-//!    counter; otherwise reset it.
-//! 2. If the silent counter reaches `silence_reset_chunks`, commit the current
-//!    live tail as a `Segment` and clear the rolling buffer (the "silence
-//!    reset"). Skip transcription this round.
-//! 3. Otherwise, append the chunk to the rolling buffer (dropping the oldest
-//!    frames if past capacity) and run inference on the full buffer.
-//! 4. Emit the new transcript (committed segments + live tail).
-//!
-//! Decoupling this from the actual model lets us unit-test the rolling-buffer
-//! / silence semantics with a fake transcriber.
+//! Engine-agnostic streaming driver. Wraps a [`StreamingTranscriber`] and
+//! turns its frame-level partial / endpoint events into a cumulative
+//! [`Transcript`]. Endpointing happens inside the recognizer; this module
+//! is just transcript bookkeeping.
 
 use crate::asr::{AsrError, Segment, Transcript};
-use crate::audio::{rms_dbfs, RollingBuffer, SAMPLE_RATE_HZ};
 
-/// Stateless transcription. Implementations: `SherpaEngine` (real), `FakeTranscriber` (tests).
-pub trait Transcriber: Send {
-    fn transcribe(&mut self, audio: &[f32]) -> Result<String, AsrError>;
+/// One frame-level update from the streaming recognizer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StreamingUpdate {
+    /// Current best hypothesis. May shrink, grow, or be rewritten on the
+    /// next tick.
+    Partial(String),
+    /// The recognizer hit one of its endpoint rules. The string is the
+    /// final text for the segment that just ended; the next `accept_waveform`
+    /// call starts a fresh segment.
+    Endpoint(String),
+    /// Nothing new this tick — either not enough samples to decode another
+    /// frame, or the hypothesis text didn't change.
+    Idle,
 }
 
-/// Configuration the driver needs. A subset of `Config`; the orchestration
-/// layer translates one into the other.
-#[derive(Debug, Clone)]
-pub struct DriverConfig {
-    pub rolling_buffer_samples: usize,
-    pub silence_threshold_dbfs: f32,
-    pub silence_reset_chunks: u32,
+/// What a streaming ASR backend must expose.
+pub trait StreamingTranscriber: Send {
+    /// Hand the recognizer some audio. Samples must be 16 kHz mono f32 in
+    /// the range \[-1.0, 1.0\]. Cheap — the recognizer queues them
+    /// internally; the actual decode happens during `poll`.
+    fn accept_waveform(&mut self, samples: &[f32]) -> Result<(), AsrError>;
+
+    /// Drive the decoder forward and report what changed. Call this in a
+    /// loop after every `accept_waveform` until it returns `Idle`.
+    fn poll(&mut self) -> Result<StreamingUpdate, AsrError>;
+
+    /// Tell the recognizer no more samples are coming. Forces any partial
+    /// frame to be decoded and flushed.
+    fn input_finished(&mut self) -> Result<(), AsrError>;
+
+    /// Drop all state and start a fresh utterance.
+    fn reset(&mut self) -> Result<(), AsrError>;
 }
 
-impl DriverConfig {
-    pub fn from_config(c: &crate::config::Config) -> Self {
-        Self {
-            rolling_buffer_samples: c.rolling_buffer_samples(SAMPLE_RATE_HZ),
-            silence_threshold_dbfs: c.silence_threshold_dbfs,
-            silence_reset_chunks: c.silence_reset_chunks(),
-        }
-    }
-}
-
-/// The streaming driver. Owns the rolling buffer and the committed-segment
-/// list for the current session. Reset between sessions via [`StreamingDriver::reset`].
+/// Cumulative transcript state for one recording session. `ingest` per
+/// audio chunk, `finalize` once on hotkey release.
+#[derive(Default)]
 pub struct StreamingDriver {
-    config: DriverConfig,
-    rolling: RollingBuffer,
     committed: Vec<Segment>,
-    consecutive_silent_chunks: u32,
-    speech_started: bool,
+    live_tail: String,
 }
 
 impl StreamingDriver {
-    pub fn new(config: DriverConfig) -> Self {
-        let capacity = config.rolling_buffer_samples;
-        Self {
-            config,
-            rolling: RollingBuffer::new(capacity),
-            committed: Vec::new(),
-            consecutive_silent_chunks: 0,
-            speech_started: false,
-        }
+    pub fn new() -> Self {
+        Self::default()
     }
 
-    pub fn reset(&mut self) {
-        self.rolling.clear();
-        self.committed.clear();
-        self.consecutive_silent_chunks = 0;
-        self.speech_started = false;
-    }
-
-    pub fn current_transcript(&self, live_tail: String) -> Transcript {
+    pub fn current_transcript(&self) -> Transcript {
         Transcript {
             committed: self.committed.clone(),
-            live_tail,
+            live_tail: self.live_tail.clone(),
         }
     }
 
-    /// Ingest one audio chunk. Returns:
-    /// - `Some(transcript)` if the transcript changed
-    /// - `None` if the chunk was silent before speech started (no transcription run)
+    /// Push `chunk` to the recognizer, then drain partials/endpoints.
+    /// Returns the post-drain transcript if anything changed.
     pub fn ingest(
         &mut self,
         chunk: &[f32],
-        transcriber: &mut dyn Transcriber,
+        transcriber: &mut dyn StreamingTranscriber,
     ) -> Result<Option<Transcript>, AsrError> {
-        let energy = rms_dbfs(chunk);
-        let is_silent = energy < self.config.silence_threshold_dbfs;
+        transcriber.accept_waveform(chunk)?;
+        self.drain(transcriber)
+    }
 
-        if is_silent {
-            self.consecutive_silent_chunks += 1;
-            if !self.speech_started {
-                // Leading silence: don't even buffer it. Prevents hallucinations.
-                return Ok(None);
-            }
-            // Mid-utterance silence: append to the buffer (we may still be in a pause)
-            // but check for the reset threshold.
-            self.rolling.push(chunk);
-            if self.consecutive_silent_chunks >= self.config.silence_reset_chunks {
-                self.commit_current_pass(transcriber)?;
-                self.rolling.clear();
-                self.speech_started = false;
-                self.consecutive_silent_chunks = 0;
-                return Ok(Some(self.current_transcript(String::new())));
-            }
+    /// Drive the recognizer to its final state for the current session and
+    /// return the resulting transcript.
+    pub fn finalize(
+        &mut self,
+        transcriber: &mut dyn StreamingTranscriber,
+    ) -> Result<Transcript, AsrError> {
+        transcriber.input_finished()?;
+        self.drain(transcriber)?;
+        // Commit whatever's still sitting in the live tail — input is done,
+        // so by definition the partial we have is the best we'll get.
+        if !self.live_tail.trim().is_empty() {
+            self.committed.push(Segment {
+                text: std::mem::take(&mut self.live_tail),
+            });
         } else {
-            self.consecutive_silent_chunks = 0;
-            self.speech_started = true;
-            self.rolling.push(chunk);
+            self.live_tail.clear();
         }
-
-        if self.rolling.is_empty() {
-            return Ok(None);
-        }
-        let audio = self.rolling.to_vec();
-        let text = transcriber.transcribe(&audio)?;
-        Ok(Some(self.current_transcript(text)))
+        Ok(self.current_transcript())
     }
 
-    /// Flush any pending audio and return the final transcript. Called at
-    /// session end (hotkey release or auto-stop).
-    pub fn finalize(&mut self, transcriber: &mut dyn Transcriber) -> Result<Transcript, AsrError> {
-        if self.rolling.is_empty() {
-            return Ok(self.current_transcript(String::new()));
+    fn drain(
+        &mut self,
+        transcriber: &mut dyn StreamingTranscriber,
+    ) -> Result<Option<Transcript>, AsrError> {
+        let mut changed = false;
+        loop {
+            match transcriber.poll()? {
+                StreamingUpdate::Partial(text) => {
+                    // Skip empty/whitespace partials. Sherpa can emit "" mid-
+                    // utterance during silence frames; letting that overwrite
+                    // live_tail would briefly clear what's been typed and force
+                    // a backspace burst when the next non-empty partial arrives.
+                    if text.trim().is_empty() {
+                        continue;
+                    }
+                    if text != self.live_tail {
+                        self.live_tail = text;
+                        changed = true;
+                    }
+                }
+                StreamingUpdate::Endpoint(text) => {
+                    if !text.trim().is_empty() {
+                        self.committed.push(Segment { text });
+                        changed = true;
+                    }
+                    if !self.live_tail.is_empty() {
+                        self.live_tail.clear();
+                        changed = true;
+                    }
+                }
+                StreamingUpdate::Idle => break,
+            }
         }
-        let audio = self.rolling.to_vec();
-        let text = transcriber.transcribe(&audio)?;
-        if !text.trim().is_empty() {
-            self.committed.push(Segment { text });
-        }
-        self.rolling.clear();
-        Ok(self.current_transcript(String::new()))
-    }
-
-    fn commit_current_pass(&mut self, transcriber: &mut dyn Transcriber) -> Result<(), AsrError> {
-        if self.rolling.is_empty() {
-            return Ok(());
-        }
-        let audio = self.rolling.to_vec();
-        let text = transcriber.transcribe(&audio)?;
-        if !text.trim().is_empty() {
-            self.committed.push(Segment { text });
-        }
-        Ok(())
+        Ok(if changed {
+            Some(self.current_transcript())
+        } else {
+            None
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
 
-    /// Returns whatever string was last set on it. Useful for asserting on
-    /// the driver's behavior without running a real model.
+    /// Replays a scripted sequence of updates as the driver polls. One
+    /// scripted update is consumed per `poll()` call; `accept_waveform`
+    /// just records how many samples were pushed.
     #[derive(Default)]
-    struct FakeTranscriber {
-        next_text: String,
-        calls: Vec<usize>,
+    struct FakeStreaming {
+        queue: VecDeque<StreamingUpdate>,
+        samples_pushed: usize,
+        input_finished_calls: usize,
+        resets: usize,
     }
 
-    impl Transcriber for FakeTranscriber {
-        fn transcribe(&mut self, audio: &[f32]) -> Result<String, AsrError> {
-            self.calls.push(audio.len());
-            Ok(self.next_text.clone())
+    impl FakeStreaming {
+        fn enqueue<I: IntoIterator<Item = StreamingUpdate>>(&mut self, updates: I) {
+            self.queue.extend(updates);
         }
     }
 
-    fn cfg() -> DriverConfig {
-        DriverConfig {
-            rolling_buffer_samples: 16_000 * 30, // 30s
-            silence_threshold_dbfs: -45.0,
-            silence_reset_chunks: 3,
+    impl StreamingTranscriber for FakeStreaming {
+        fn accept_waveform(&mut self, samples: &[f32]) -> Result<(), AsrError> {
+            self.samples_pushed += samples.len();
+            Ok(())
+        }
+        fn poll(&mut self) -> Result<StreamingUpdate, AsrError> {
+            Ok(self.queue.pop_front().unwrap_or(StreamingUpdate::Idle))
+        }
+        fn input_finished(&mut self) -> Result<(), AsrError> {
+            self.input_finished_calls += 1;
+            Ok(())
+        }
+        fn reset(&mut self) -> Result<(), AsrError> {
+            self.resets += 1;
+            self.queue.clear();
+            Ok(())
         }
     }
 
-    /// Generate a chunk of audio at the given amplitude. `amp=0.0` is silence;
-    /// `amp=0.1` is well above the -45 dBFS gate (`20*log10(0.1) = -20 dBFS`).
-    fn chunk(samples: usize, amp: f32) -> Vec<f32> {
-        (0..samples).map(|i| amp * (i as f32 * 0.1).sin()).collect()
+    fn chunk(n: usize) -> Vec<f32> {
+        vec![0.1; n]
     }
 
     #[test]
-    fn leading_silence_is_skipped() {
-        let mut d = StreamingDriver::new(cfg());
-        let mut t = FakeTranscriber::default();
-        let silence = chunk(1600, 0.0);
-        let result = d.ingest(&silence, &mut t).unwrap();
-        assert!(result.is_none());
-        assert!(t.calls.is_empty(), "should not transcribe leading silence");
-    }
-
-    #[test]
-    fn first_speech_chunk_triggers_transcription() {
-        let mut d = StreamingDriver::new(cfg());
-        let mut t = FakeTranscriber {
-            next_text: "hello".into(),
-            ..Default::default()
-        };
-        let speech = chunk(1600, 0.2);
-        let result = d.ingest(&speech, &mut t).unwrap().unwrap();
+    fn partial_becomes_live_tail() {
+        let mut d = StreamingDriver::new();
+        let mut t = FakeStreaming::default();
+        t.enqueue([StreamingUpdate::Partial("hello".into())]);
+        let result = d.ingest(&chunk(1600), &mut t).unwrap().unwrap();
         assert_eq!(result.live_tail, "hello");
         assert!(result.committed.is_empty());
-        assert_eq!(t.calls.len(), 1);
     }
 
     #[test]
-    fn silence_reset_commits_segment_and_clears_buffer() {
-        let mut d = StreamingDriver::new(cfg());
-        let mut t = FakeTranscriber {
-            next_text: "hello world".into(),
-            ..Default::default()
-        };
-        let speech = chunk(1600, 0.2);
-        let silence = chunk(1600, 0.0);
-        d.ingest(&speech, &mut t).unwrap();
-        // Three silent chunks should trigger the silence reset
-        d.ingest(&silence, &mut t).unwrap();
-        d.ingest(&silence, &mut t).unwrap();
-        let result = d.ingest(&silence, &mut t).unwrap().unwrap();
+    fn duplicate_partial_yields_no_change() {
+        let mut d = StreamingDriver::new();
+        let mut t = FakeStreaming::default();
+        t.enqueue([StreamingUpdate::Partial("hello".into())]);
+        let _ = d.ingest(&chunk(1600), &mut t).unwrap();
+        // Second ingest with the same partial — should not signal a change.
+        t.enqueue([StreamingUpdate::Partial("hello".into())]);
+        let result = d.ingest(&chunk(1600), &mut t).unwrap();
+        assert!(result.is_none(), "no-change partial should not emit a transcript");
+    }
+
+    #[test]
+    fn endpoint_commits_segment_and_clears_tail() {
+        let mut d = StreamingDriver::new();
+        let mut t = FakeStreaming::default();
+        t.enqueue([
+            StreamingUpdate::Partial("hello".into()),
+            StreamingUpdate::Endpoint("hello world".into()),
+        ]);
+        let result = d.ingest(&chunk(1600), &mut t).unwrap().unwrap();
         assert_eq!(result.committed.len(), 1);
         assert_eq!(result.committed[0].text, "hello world");
         assert_eq!(result.live_tail, "");
     }
 
     #[test]
-    fn post_reset_speech_starts_a_new_pass() {
-        let mut d = StreamingDriver::new(cfg());
-        let mut t = FakeTranscriber {
-            next_text: "first segment".into(),
-            ..Default::default()
-        };
-        let speech = chunk(1600, 0.2);
-        let silence = chunk(1600, 0.0);
-        d.ingest(&speech, &mut t).unwrap();
-        for _ in 0..3 {
-            d.ingest(&silence, &mut t).unwrap();
-        }
-        t.next_text = "second segment".into();
-        let result = d.ingest(&speech, &mut t).unwrap().unwrap();
+    fn post_endpoint_partial_starts_a_new_tail() {
+        let mut d = StreamingDriver::new();
+        let mut t = FakeStreaming::default();
+        t.enqueue([
+            StreamingUpdate::Endpoint("first segment".into()),
+            StreamingUpdate::Partial("second".into()),
+        ]);
+        let result = d.ingest(&chunk(1600), &mut t).unwrap().unwrap();
         assert_eq!(result.committed.len(), 1);
         assert_eq!(result.committed[0].text, "first segment");
-        assert_eq!(result.live_tail, "second segment");
+        assert_eq!(result.live_tail, "second");
     }
 
     #[test]
     fn finalize_commits_pending_live_tail() {
-        let mut d = StreamingDriver::new(cfg());
-        let mut t = FakeTranscriber {
-            next_text: "final".into(),
-            ..Default::default()
-        };
-        let speech = chunk(1600, 0.2);
-        d.ingest(&speech, &mut t).unwrap();
+        let mut d = StreamingDriver::new();
+        let mut t = FakeStreaming::default();
+        t.enqueue([StreamingUpdate::Partial("trailing".into())]);
+        d.ingest(&chunk(1600), &mut t).unwrap();
+        // No more updates queued — finalize should commit the tail as-is.
         let result = d.finalize(&mut t).unwrap();
+        assert_eq!(t.input_finished_calls, 1);
         assert_eq!(result.committed.len(), 1);
-        assert_eq!(result.committed[0].text, "final");
+        assert_eq!(result.committed[0].text, "trailing");
         assert!(result.live_tail.is_empty());
     }
 
     #[test]
-    fn finalize_on_empty_buffer_returns_empty_transcript() {
-        let mut d = StreamingDriver::new(cfg());
-        let mut t = FakeTranscriber::default();
+    fn finalize_on_empty_state_returns_empty_transcript() {
+        let mut d = StreamingDriver::new();
+        let mut t = FakeStreaming::default();
         let result = d.finalize(&mut t).unwrap();
         assert!(result.committed.is_empty());
         assert!(result.live_tail.is_empty());
     }
 
     #[test]
-    fn finalize_drops_empty_transcription() {
-        let mut d = StreamingDriver::new(cfg());
-        let mut t = FakeTranscriber {
-            next_text: "".into(),
-            ..Default::default()
-        };
-        let speech = chunk(1600, 0.2);
-        d.ingest(&speech, &mut t).unwrap();
+    fn finalize_drops_whitespace_only_tail() {
+        let mut d = StreamingDriver::new();
+        let mut t = FakeStreaming::default();
+        t.enqueue([StreamingUpdate::Partial("   ".into())]);
+        d.ingest(&chunk(1600), &mut t).unwrap();
         let result = d.finalize(&mut t).unwrap();
         assert!(
             result.committed.is_empty(),
-            "empty transcription should not be committed"
+            "whitespace-only tail must not become a committed segment"
         );
     }
 
     #[test]
-    fn reset_returns_driver_to_pristine_state() {
-        let mut d = StreamingDriver::new(cfg());
-        let mut t = FakeTranscriber {
-            next_text: "a".into(),
-            ..Default::default()
-        };
-        d.ingest(&chunk(1600, 0.2), &mut t).unwrap();
-        d.reset();
-        // After reset, leading silence should once again be skipped
-        let result = d.ingest(&chunk(1600, 0.0), &mut t).unwrap();
-        assert!(result.is_none());
+    fn ingest_pushes_samples_to_transcriber() {
+        let mut d = StreamingDriver::new();
+        let mut t = FakeStreaming::default();
+        d.ingest(&chunk(1600), &mut t).unwrap();
+        d.ingest(&chunk(800), &mut t).unwrap();
+        assert_eq!(t.samples_pushed, 2400);
     }
 
     #[test]
-    fn brief_mid_utterance_silence_does_not_reset() {
-        let mut d = StreamingDriver::new(cfg());
-        let mut t = FakeTranscriber {
-            next_text: "ongoing".into(),
-            ..Default::default()
-        };
-        let speech = chunk(1600, 0.2);
-        let silence = chunk(1600, 0.0);
-        d.ingest(&speech, &mut t).unwrap();
-        // Only 2 silent chunks; threshold is 3 in test config
-        d.ingest(&silence, &mut t).unwrap();
-        let result = d.ingest(&silence, &mut t).unwrap().unwrap();
-        assert!(result.committed.is_empty(), "no reset yet");
-        assert_eq!(result.live_tail, "ongoing");
+    fn empty_endpoint_with_empty_tail_yields_no_change() {
+        let mut d = StreamingDriver::new();
+        let mut t = FakeStreaming::default();
+        t.enqueue([StreamingUpdate::Endpoint(String::new())]);
+        let result = d.ingest(&chunk(1600), &mut t).unwrap();
+        assert!(result.is_none(), "empty endpoint on empty tail must not signal change");
+    }
+
+    #[test]
+    fn whitespace_only_endpoint_does_not_commit() {
+        let mut d = StreamingDriver::new();
+        let mut t = FakeStreaming::default();
+        t.enqueue([StreamingUpdate::Endpoint("   ".into())]);
+        let result = d.ingest(&chunk(1600), &mut t).unwrap();
+        assert!(
+            result.is_none() || result.unwrap().committed.is_empty(),
+            "whitespace-only endpoint must not commit a segment"
+        );
+    }
+
+    #[test]
+    fn finalize_after_endpoint_does_not_double_commit() {
+        let mut d = StreamingDriver::new();
+        let mut t = FakeStreaming::default();
+        t.enqueue([StreamingUpdate::Endpoint("hello".into())]);
+        d.ingest(&chunk(1600), &mut t).unwrap();
+        let result = d.finalize(&mut t).unwrap();
+        assert_eq!(result.committed.len(), 1, "must not re-commit after a clean endpoint");
+        assert_eq!(result.committed[0].text, "hello");
+        assert!(result.live_tail.is_empty());
+    }
+
+    #[test]
+    fn chained_endpoints_in_one_drain_all_commit_in_order() {
+        let mut d = StreamingDriver::new();
+        let mut t = FakeStreaming::default();
+        t.enqueue([
+            StreamingUpdate::Endpoint("first".into()),
+            StreamingUpdate::Endpoint("second".into()),
+            StreamingUpdate::Endpoint("third".into()),
+        ]);
+        let result = d.ingest(&chunk(1600), &mut t).unwrap().unwrap();
+        assert_eq!(result.committed.len(), 3);
+        assert_eq!(result.committed[0].text, "first");
+        assert_eq!(result.committed[1].text, "second");
+        assert_eq!(result.committed[2].text, "third");
+        assert!(result.live_tail.is_empty());
+    }
+
+    #[test]
+    fn empty_partial_does_not_clear_live_tail() {
+        let mut d = StreamingDriver::new();
+        let mut t = FakeStreaming::default();
+        t.enqueue([StreamingUpdate::Partial("hello".into())]);
+        d.ingest(&chunk(1600), &mut t).unwrap();
+        // Now an empty partial arrives (silence frame, dropout)
+        t.enqueue([StreamingUpdate::Partial(String::new())]);
+        let result = d.ingest(&chunk(1600), &mut t).unwrap();
+        // Either None (no change) is acceptable, or Some with live_tail still "hello".
+        match result {
+            None => {}
+            Some(t) => assert_eq!(t.live_tail, "hello", "empty partial must not erase live_tail"),
+        }
+    }
+
+    #[test]
+    fn whitespace_only_partial_does_not_clear_live_tail() {
+        let mut d = StreamingDriver::new();
+        let mut t = FakeStreaming::default();
+        t.enqueue([StreamingUpdate::Partial("hello".into())]);
+        d.ingest(&chunk(1600), &mut t).unwrap();
+        t.enqueue([StreamingUpdate::Partial("   ".into())]);
+        let result = d.ingest(&chunk(1600), &mut t).unwrap();
+        match result {
+            None => {}
+            Some(t) => assert_eq!(t.live_tail, "hello"),
+        }
+    }
+
+    #[test]
+    fn mixed_partial_endpoint_idle_interleaving() {
+        let mut d = StreamingDriver::new();
+        let mut t = FakeStreaming::default();
+        // First chunk: partial grows, then endpoint commits, then new partial starts.
+        t.enqueue([
+            StreamingUpdate::Partial("foo".into()),
+            StreamingUpdate::Partial("foo bar".into()),
+            StreamingUpdate::Endpoint("foo bar baz".into()),
+            StreamingUpdate::Partial("qux".into()),
+        ]);
+        let result = d.ingest(&chunk(1600), &mut t).unwrap().unwrap();
+        assert_eq!(result.committed.len(), 1);
+        assert_eq!(result.committed[0].text, "foo bar baz");
+        assert_eq!(result.live_tail, "qux");
+        // Second chunk: a refinement of the in-progress tail, then idle.
+        t.enqueue([
+            StreamingUpdate::Partial("qux quux".into()),
+            StreamingUpdate::Idle,
+        ]);
+        let result = d.ingest(&chunk(1600), &mut t).unwrap().unwrap();
+        assert_eq!(result.committed.len(), 1);
+        assert_eq!(result.live_tail, "qux quux");
     }
 }

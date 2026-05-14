@@ -46,6 +46,17 @@ jobs:
           key: sherpa-rs-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             sherpa-rs-${{ runner.os }}-
+      # If the sherpa-onnx download is missing (cache miss or stale rust-cache
+      # restored a target/ with the build-script stamp but no libs), force the
+      # sherpa-rs-sys build script to re-run by cleaning that crate's outputs.
+      - name: ensure sherpa-rs-sys rebuilds when libs are missing
+        run: |
+          if ! find ~/.cache/sherpa-rs -name 'libonnxruntime*' 2>/dev/null | grep -q .; then
+            echo "sherpa-onnx libs missing; cleaning sherpa-rs-sys to force re-download"
+            cargo clean -p sherpa-rs-sys || true
+          else
+            echo "sherpa-onnx libs present in ~/.cache/sherpa-rs"
+          fi
       - name: install linux deps
         if: matrix.os == 'ubuntu-latest'
         run: |
@@ -73,6 +84,17 @@ jobs:
           key: sherpa-rs-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             sherpa-rs-${{ runner.os }}-
+      # If the sherpa-onnx download is missing (cache miss or stale rust-cache
+      # restored a target/ with the build-script stamp but no libs), force the
+      # sherpa-rs-sys build script to re-run by cleaning that crate's outputs.
+      - name: ensure sherpa-rs-sys rebuilds when libs are missing
+        run: |
+          if ! find ~/.cache/sherpa-rs -name 'libonnxruntime*' 2>/dev/null | grep -q .; then
+            echo "sherpa-onnx libs missing; cleaning sherpa-rs-sys to force re-download"
+            cargo clean -p sherpa-rs-sys || true
+          else
+            echo "sherpa-onnx libs present in ~/.cache/sherpa-rs"
+          fi
       - name: install linux deps
         if: matrix.os == 'ubuntu-latest'
         run: |

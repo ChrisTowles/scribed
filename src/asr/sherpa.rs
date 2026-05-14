@@ -70,7 +70,9 @@ fn find_onnx(dir: &Path, role: &str) -> PathBuf {
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
             if !name.starts_with(role) {
                 continue;
             }
@@ -285,24 +287,45 @@ mod tests {
         // `encoder-epoch-99-avg-1-chunk-16-left-128.onnx`.
         let dir = tempdir().unwrap();
         fs::write(
-            dir.path().join("encoder-epoch-99-avg-1-chunk-16-left-128.onnx"),
+            dir.path()
+                .join("encoder-epoch-99-avg-1-chunk-16-left-128.onnx"),
             b"stub",
         )
         .unwrap();
         fs::write(
-            dir.path().join("decoder-epoch-99-avg-1-chunk-16-left-128.onnx"),
+            dir.path()
+                .join("decoder-epoch-99-avg-1-chunk-16-left-128.onnx"),
             b"stub",
         )
         .unwrap();
         fs::write(
-            dir.path().join("joiner-epoch-99-avg-1-chunk-16-left-128.onnx"),
+            dir.path()
+                .join("joiner-epoch-99-avg-1-chunk-16-left-128.onnx"),
             b"stub",
         )
         .unwrap();
         let b = ModelBundle::from_dir(dir.path());
-        assert!(b.encoder.file_name().unwrap().to_str().unwrap().starts_with("encoder-"));
-        assert!(b.decoder.file_name().unwrap().to_str().unwrap().starts_with("decoder-"));
-        assert!(b.joiner.file_name().unwrap().to_str().unwrap().starts_with("joiner-"));
+        assert!(b
+            .encoder
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("encoder-"));
+        assert!(b
+            .decoder
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("decoder-"));
+        assert!(b
+            .joiner
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("joiner-"));
     }
 
     #[test]

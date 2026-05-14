@@ -280,11 +280,9 @@ fn background_spawn(paths: &Paths) -> crate::Result<()> {
 fn run_loop(paths: &Paths, config: &Config) -> crate::Result<()> {
     #[cfg(feature = "asr")]
     let runtime: Option<Arc<Mutex<crate::service::Runtime>>> = {
-        let model_dir = crate::asr::download::ensure(
-            &crate::asr::download::STREAMING_MODEL,
-            &paths.cache_dir,
-        )
-        .map_err(|e| anyhow::anyhow!("fetch ASR model: {e}"))?;
+        let model_dir =
+            crate::asr::download::ensure(&crate::asr::download::STREAMING_MODEL, &paths.cache_dir)
+                .map_err(|e| anyhow::anyhow!("fetch ASR model: {e}"))?;
         let rt = crate::service::Runtime::load(config, model_dir.clone())
             .map_err(|e| anyhow::anyhow!("load ASR model from {}: {e}", model_dir.display()))?;
         Some(Arc::new(Mutex::new(rt)))

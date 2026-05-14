@@ -249,34 +249,31 @@ fn record_and_stream(params: SessionParams) {
         }
 
         match rx.recv_timeout(Duration::from_millis(50)) {
-            Ok(chunk) => match gate_and_ingest(
-                chunk,
-                silence_threshold_dbfs,
-                &mut driver,
-                &transcriber,
-            ) {
-                Ok(Some(t)) => {
-                    consecutive_errors = 0;
-                    if t.committed.len() != last_committed_count {
-                        last_committed_count = t.committed.len();
-                        last_committed_change = Instant::now();
+            Ok(chunk) => {
+                match gate_and_ingest(chunk, silence_threshold_dbfs, &mut driver, &transcriber) {
+                    Ok(Some(t)) => {
+                        consecutive_errors = 0;
+                        if t.committed.len() != last_committed_count {
+                            last_committed_count = t.committed.len();
+                            last_committed_change = Instant::now();
+                        }
+                        pending = Some(t);
                     }
-                    pending = Some(t);
-                }
-                Ok(None) => {
-                    consecutive_errors = 0;
-                }
-                Err(()) => {
-                    consecutive_errors += 1;
-                    if consecutive_errors >= MAX_CONSECUTIVE_INGEST_ERRORS {
-                        tracing::error!(
-                            count = consecutive_errors,
-                            "consecutive ingest errors exceeded threshold; aborting session"
-                        );
-                        break;
+                    Ok(None) => {
+                        consecutive_errors = 0;
+                    }
+                    Err(()) => {
+                        consecutive_errors += 1;
+                        if consecutive_errors >= MAX_CONSECUTIVE_INGEST_ERRORS {
+                            tracing::error!(
+                                count = consecutive_errors,
+                                "consecutive ingest errors exceeded threshold; aborting session"
+                            );
+                            break;
+                        }
                     }
                 }
-            },
+            }
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
         }

@@ -51,8 +51,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bundle = ModelBundle::from_dir(&model_dir);
     println!("Loading model (provider=cpu)...");
     let t = Instant::now();
-    let mut transcriber =
-        SherpaStreamingTranscriber::load(&bundle, &StreamingConfig::default())?;
+    let mut transcriber = SherpaStreamingTranscriber::load(&bundle, &StreamingConfig::default())?;
     println!("  loaded in {:?}", t.elapsed());
 
     let samples = read_wav_to_16khz_mono_f32(&wav_path)?;

@@ -52,9 +52,7 @@ struct DaemonGuard {
 
 impl DaemonGuard {
     fn new(pid_file: std::path::PathBuf) -> Self {
-        let seen = std::sync::Arc::new(parking_lot::Mutex::new(
-            std::collections::BTreeSet::new(),
-        ));
+        let seen = std::sync::Arc::new(parking_lot::Mutex::new(std::collections::BTreeSet::new()));
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let seen_for_thread = seen.clone();
         let stop_for_thread = stop.clone();

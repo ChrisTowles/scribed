@@ -195,7 +195,10 @@ mod tests {
         // Second ingest with the same partial — should not signal a change.
         t.enqueue([StreamingUpdate::Partial("hello".into())]);
         let result = d.ingest(&chunk(1600), &mut t).unwrap();
-        assert!(result.is_none(), "no-change partial should not emit a transcript");
+        assert!(
+            result.is_none(),
+            "no-change partial should not emit a transcript"
+        );
     }
 
     #[test]
@@ -277,7 +280,10 @@ mod tests {
         let mut t = FakeStreaming::default();
         t.enqueue([StreamingUpdate::Endpoint(String::new())]);
         let result = d.ingest(&chunk(1600), &mut t).unwrap();
-        assert!(result.is_none(), "empty endpoint on empty tail must not signal change");
+        assert!(
+            result.is_none(),
+            "empty endpoint on empty tail must not signal change"
+        );
     }
 
     #[test]
@@ -299,7 +305,11 @@ mod tests {
         t.enqueue([StreamingUpdate::Endpoint("hello".into())]);
         d.ingest(&chunk(1600), &mut t).unwrap();
         let result = d.finalize(&mut t).unwrap();
-        assert_eq!(result.committed.len(), 1, "must not re-commit after a clean endpoint");
+        assert_eq!(
+            result.committed.len(),
+            1,
+            "must not re-commit after a clean endpoint"
+        );
         assert_eq!(result.committed[0].text, "hello");
         assert!(result.live_tail.is_empty());
     }
@@ -333,7 +343,10 @@ mod tests {
         // Either None (no change) is acceptable, or Some with live_tail still "hello".
         match result {
             None => {}
-            Some(t) => assert_eq!(t.live_tail, "hello", "empty partial must not erase live_tail"),
+            Some(t) => assert_eq!(
+                t.live_tail, "hello",
+                "empty partial must not erase live_tail"
+            ),
         }
     }
 

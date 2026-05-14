@@ -106,9 +106,11 @@ fn start_background_status_toggle_stop_round_trip() {
         .assert()
         .success();
 
-    // 2. wait for pid file to appear
+    // 2. wait for pid file to appear. Generous deadline because the daemon
+    // now blocks on model load (~1-3s on dev hardware, up to ~10s on slow
+    // CI runners) before writing the pid file.
     assert!(
-        wait_until(Duration::from_secs(3), || pid_file.exists()
+        wait_until(Duration::from_secs(30), || pid_file.exists()
             && sock.exists()),
         "daemon never wrote pid file / socket"
     );
@@ -171,7 +173,7 @@ fn double_start_fails_with_already_running() {
         .args(["start", "--background"])
         .assert()
         .success();
-    assert!(wait_until(Duration::from_secs(3), || cd
+    assert!(wait_until(Duration::from_secs(30), || cd
         .join("daemon.pid")
         .exists()));
 

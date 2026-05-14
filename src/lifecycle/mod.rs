@@ -258,9 +258,9 @@ fn background_spawn(paths: &Paths) -> crate::Result<()> {
     tracing::info!(pid = child_pid, "spawned background daemon");
 
     // Poll the pid file briefly to confirm the child wrote its identity.
-    // Model load takes a few seconds, so we give it more headroom than the
-    // pure-IPC daemon needed.
-    let deadline = Instant::now() + Duration::from_secs(10);
+    // Model load + (on cold cache) model fetch takes time — on a slow runner
+    // the ~442 MB download can run for ~30 s, so we give plenty of headroom.
+    let deadline = Instant::now() + Duration::from_secs(120);
     while Instant::now() < deadline {
         if let Ok(Some(_)) = pidfile::read(&paths.pid_file) {
             println!("scribed: started (pid {child_pid})");

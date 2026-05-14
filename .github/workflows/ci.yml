@@ -75,6 +75,10 @@ jobs:
           sudo apt-get install -y libasound2-dev libdbus-1-dev libxcb1-dev
       - name: install nextest
         uses: taiki-e/install-action@nextest
+      # Pre-fetch the ASR model so the daemon_lifecycle integration test
+      # doesn't time out waiting for the ~442MB download. On cache hit this
+      # is a few-ms no-op; on cache miss it primes the cache for future runs.
+      - run: cargo run --release --bin scribed -- fetch-model
       - run: cargo nextest run
       - run: cargo test --doc
 

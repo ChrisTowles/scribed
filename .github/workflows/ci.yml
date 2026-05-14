@@ -65,7 +65,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/scribed
-          key: scribed-model-${{ runner.os }}-sherpa-onnx-nemotron-speech-streaming-en-0.6b-80ms-int8-2026-04-25
+          key: scribed-model-${{ runner.os }}-sherpa-onnx-nemotron-speech-streaming-en-0.6b-1120ms-int8-2026-04-25
           restore-keys: |
             scribed-model-${{ runner.os }}-
       - name: install linux deps

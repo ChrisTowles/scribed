@@ -20,7 +20,7 @@ cargo build --release
 ./target/release/scribed fetch-model
 
 # End-to-end smoke test: transcribe a WAV without starting the daemon
-./target/release/transcribe_wav ~/.cache/scribed/sherpa-onnx-nemotron-speech-streaming-en-0.6b-80ms-int8-2026-04-25/test_wavs/0.wav
+./target/release/transcribe_wav ~/.cache/scribed/sherpa-onnx-nemotron-speech-streaming-en-0.6b-1120ms-int8-2026-04-25/test_wavs/0.wav
 
 # Daemon control
 ./target/release/scribed status

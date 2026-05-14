@@ -21,20 +21,21 @@ pub struct ModelArchive {
     pub extracted_dir: &'static str,
 }
 
-/// NVIDIA Nemotron streaming 0.6B (FastConformer-CacheAware-RNNT, 80 ms chunk,
+/// NVIDIA Nemotron streaming 0.6B (FastConformer-CacheAware-RNNT, 1120 ms chunk,
 /// int8 quantized, 16 kHz). Trained on ~530k hours; emits mixed-case text with
 /// native punctuation. ~442 MB download. NVIDIA Open Model License.
 ///
-/// The 80 ms chunk is the smallest-latency variant — partials land sub-100 ms
-/// after audio, matching the live-dictation feel of the previous LibriSpeech
-/// Zipformer. The 560 ms / 1120 ms bundles trade interactive feel for marginal
-/// accuracy gains; if dictation feels too laggy on slower hardware, swap to a
-/// larger chunk by changing `url` + `extracted_dir` (cache key in CI follows
-/// the bundle name).
+/// Chunk-size variants ship at 80/160/560/1120 ms. The smaller chunks land
+/// partials sub-100 ms after audio but rarely emit punctuation (not enough
+/// lookahead context). 1120 ms is the highest-quality variant: best WER and
+/// reliable comma/period/question-mark output, at the cost of ~1 s lag
+/// between voice and visible text. To trade some punctuation for snappier
+/// partials, swap to the 560 ms or 160 ms variant by changing `url` +
+/// `extracted_dir` (the CI cache key follows the bundle name).
 pub const STREAMING_MODEL: ModelArchive = ModelArchive {
-    name: "nemotron-streaming-en-0.6b-80ms-int8-2026-04-25",
-    url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemotron-speech-streaming-en-0.6b-80ms-int8-2026-04-25.tar.bz2",
-    extracted_dir: "sherpa-onnx-nemotron-speech-streaming-en-0.6b-80ms-int8-2026-04-25",
+    name: "nemotron-streaming-en-0.6b-1120ms-int8-2026-04-25",
+    url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemotron-speech-streaming-en-0.6b-1120ms-int8-2026-04-25.tar.bz2",
+    extracted_dir: "sherpa-onnx-nemotron-speech-streaming-en-0.6b-1120ms-int8-2026-04-25",
 };
 
 /// Ensure the named model exists locally. Returns the directory containing the

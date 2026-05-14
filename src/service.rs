@@ -10,3 +10,9 @@
 pub mod timer;
 
 pub use timer::{RecordingTimer, TimerConfig, TimerEvent};
+
+#[cfg(feature = "asr")]
+pub mod runtime;
+
+#[cfg(feature = "asr")]
+pub use runtime::Runtime;

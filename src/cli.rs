@@ -60,10 +60,7 @@ pub fn run() -> Result<()> {
     init_logging(cli.log_level.as_deref());
 
     let paths = match cli.config_dir {
-        Some(ref dir) => {
-            let cache = dir.join("cache");
-            Paths::from_base(dir, &cache)
-        }
+        Some(ref dir) => Paths::from_base(dir, &crate::paths::default_cache_dir()),
         None => Paths::from_env(),
     };
 

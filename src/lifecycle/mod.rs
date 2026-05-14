@@ -53,12 +53,48 @@ pub fn start(paths: &Paths, config: &Config, background: bool) -> crate::Result<
         pidfile::remove(&paths.pid_file)?;
     }
 
+    // Surface environment issues to the terminal before we fork into the
+    // background and the user loses sight of stderr.
+    preflight_warnings(config);
+
     if background {
         background_spawn(paths)?;
     } else {
         run_foreground(paths, config)?;
     }
     Ok(())
+}
+
+/// Prints user-visible warnings to stderr for environment problems that won't
+/// stop the daemon from starting, but will degrade behavior. Called from
+/// [`start`] before the optional fork so the messages reach the user's
+/// terminal, not the daemon log.
+fn preflight_warnings(config: &Config) {
+    use crate::config::OutputMode;
+    use crate::output::backend;
+
+    if backend::is_wayland() {
+        let injection_intended =
+            matches!(config.output_mode, OutputMode::Auto | OutputMode::Injection);
+        let resolved = backend::select_backend_kind();
+        if injection_intended && resolved != backend::BackendKind::Ydotool {
+            let reason = if !backend::ydotool_available() {
+                "`ydotool` binary not found on PATH"
+            } else {
+                "`ydotoold` socket not found (daemon not running)"
+            };
+            eprintln!();
+            eprintln!("warning: Wayland session detected, but {reason}.");
+            eprintln!(
+                "         Dictation will fall back to the {} backend; keystroke",
+                resolved.as_str()
+            );
+            eprintln!("         injection into the focused window will not work.");
+            eprintln!("         To enable injection:");
+            eprintln!("           systemctl --user enable --now ydotoold");
+            eprintln!();
+        }
+    }
 }
 
 /// `scribed stop`.
@@ -95,6 +131,10 @@ pub fn status(paths: &Paths, config: &Config) -> crate::Result<()> {
     println!("  hotkey     : {}", config.hotkey);
     println!("  mode       : {:?}", config.mode);
     println!("  model      : {}", config.model);
+    println!(
+        "  output     : {}",
+        crate::output::backend::select_backend_kind().as_str()
+    );
 
     match pidfile::read(&paths.pid_file) {
         Ok(Some(record)) => match liveness::classify(record.pid) {
@@ -198,7 +238,9 @@ fn background_spawn(paths: &Paths) -> crate::Result<()> {
     tracing::info!(pid = child_pid, "spawned background daemon");
 
     // Poll the pid file briefly to confirm the child wrote its identity.
-    let deadline = Instant::now() + Duration::from_secs(3);
+    // Model load takes a few seconds, so we give it more headroom than the
+    // pure-IPC daemon needed.
+    let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
         if let Ok(Some(_)) = pidfile::read(&paths.pid_file) {
             println!("scribed: started (pid {child_pid})");
@@ -216,6 +258,24 @@ fn background_spawn(paths: &Paths) -> crate::Result<()> {
 /// The daemon's main async loop. Owns the control socket and waits for either
 /// a `Stop` command, a SIGTERM/SIGINT, or an internal failure.
 fn run_loop(paths: &Paths, config: &Config) -> crate::Result<()> {
+    #[cfg(feature = "asr")]
+    let runtime: Option<Arc<Mutex<crate::service::Runtime>>> = {
+        let model_dir = paths
+            .cache_dir
+            .join("sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8");
+        match crate::service::Runtime::load(config, model_dir.clone()) {
+            Ok(rt) => Some(Arc::new(Mutex::new(rt))),
+            Err(e) => {
+                tracing::warn!(
+                    ?e,
+                    dir = %model_dir.display(),
+                    "ASR runtime disabled — hotkey will toggle state but no transcription will run. Run `scribed fetch-model` to enable."
+                );
+                None
+            }
+        }
+    };
+
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
@@ -229,6 +289,8 @@ fn run_loop(paths: &Paths, config: &Config) -> crate::Result<()> {
         let handler = Arc::new(IpcHandler {
             state: state.clone(),
             shutdown: shutdown.clone(),
+            #[cfg(feature = "asr")]
+            runtime: runtime.clone(),
         });
 
         let listener = ipc::server::bind(&paths.control_socket)
@@ -255,6 +317,13 @@ fn run_loop(paths: &Paths, config: &Config) -> crate::Result<()> {
             }
         });
 
+        let _hotkey_listener = start_hotkey_listener(
+            config,
+            state.clone(),
+            #[cfg(feature = "asr")]
+            runtime.clone(),
+        );
+
         let sigint = tokio::signal::ctrl_c();
         let mut sigterm =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -277,6 +346,65 @@ fn run_loop(paths: &Paths, config: &Config) -> crate::Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+fn start_hotkey_listener(
+    config: &Config,
+    state: Arc<Mutex<DaemonState>>,
+    #[cfg(feature = "asr")] runtime: Option<Arc<Mutex<crate::service::Runtime>>>,
+) -> Option<crate::input::evdev_listener::EvdevListener> {
+    use crate::input::evdev_listener::EvdevListener;
+    use crate::input::{KeyChord, RecordingIntent};
+
+    let chord = match KeyChord::parse(&config.hotkey) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(hotkey = %config.hotkey, ?e, "invalid hotkey; listener disabled");
+            return None;
+        }
+    };
+    let chord_display = chord.to_string();
+    match EvdevListener::start(chord, config.mode, move |intent| {
+        let recording = match intent {
+            RecordingIntent::Start => true,
+            RecordingIntent::Stop => false,
+            RecordingIntent::Toggle => !state.lock().recording,
+        };
+        state.lock().recording = recording;
+        tracing::info!(?intent, recording, "hotkey");
+        #[cfg(feature = "asr")]
+        if let Some(rt) = &runtime {
+            let mut rt = rt.lock();
+            if recording {
+                rt.start_session();
+            } else {
+                rt.stop_session();
+            }
+        }
+    }) {
+        Ok(listener) => {
+            tracing::info!(hotkey = %chord_display, "hotkey listener active");
+            Some(listener)
+        }
+        Err(e) => {
+            tracing::warn!(
+                ?e,
+                "hotkey listener failed to start; daemon will run without global hotkey"
+            );
+            None
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn start_hotkey_listener(
+    _config: &Config,
+    _state: Arc<Mutex<DaemonState>>,
+    #[cfg(feature = "asr")] _runtime: Option<Arc<Mutex<crate::service::Runtime>>>,
+) -> Option<()> {
+    tracing::warn!("hotkey listener not yet implemented on this platform");
+    None
+}
+
 #[derive(Debug)]
 struct DaemonState {
     recording: bool,
@@ -287,6 +415,8 @@ struct DaemonState {
 struct IpcHandler {
     state: Arc<Mutex<DaemonState>>,
     shutdown: Arc<Notify>,
+    #[cfg(feature = "asr")]
+    runtime: Option<Arc<Mutex<crate::service::Runtime>>>,
 }
 
 impl ipc::server::CommandHandler for IpcHandler {
@@ -310,8 +440,21 @@ impl ipc::server::CommandHandler for IpcHandler {
                     DaemonReply::Ok
                 }
                 DaemonCommand::Toggle => {
-                    let mut s = self.state.lock();
-                    s.recording = !s.recording;
+                    let recording = {
+                        let mut s = self.state.lock();
+                        s.recording = !s.recording;
+                        s.recording
+                    };
+                    #[cfg(feature = "asr")]
+                    if let Some(rt) = &self.runtime {
+                        let mut rt = rt.lock();
+                        if recording {
+                            rt.start_session();
+                        } else {
+                            rt.stop_session();
+                        }
+                    }
+                    let _ = recording;
                     DaemonReply::Ok
                 }
             }

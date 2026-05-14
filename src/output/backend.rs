@@ -41,7 +41,7 @@ pub mod enigo;
 pub mod clipboard;
 
 /// Pick a backend appropriate for the current environment.
-pub fn auto_detect() -> Box<dyn KeyboardSink> {
+pub fn auto_detect() -> Box<dyn KeyboardSink + Send> {
     match select_backend_kind() {
         BackendKind::Ydotool => Box::new(ydotool::YdotoolBackend::new()),
         BackendKind::Enigo => match enigo::EnigoBackend::new() {
@@ -57,8 +57,15 @@ pub fn auto_detect() -> Box<dyn KeyboardSink> {
 }
 
 pub fn select_backend_kind() -> BackendKind {
-    if is_wayland() && ydotool_available() {
-        return BackendKind::Ydotool;
+    if is_wayland() {
+        // On Wayland the only reliable injection path is ydotool, and ydotool
+        // only works if `ydotoold` is running. Enigo can't talk to a Wayland
+        // compositor, so if the socket is missing we go straight to clipboard.
+        return if ydotool_available() && ydotool_socket_path().is_some() {
+            BackendKind::Ydotool
+        } else {
+            BackendKind::Clipboard
+        };
     }
     if cfg!(any(target_os = "linux", target_os = "macos")) {
         return BackendKind::Enigo;
@@ -75,6 +82,28 @@ pub fn is_wayland() -> bool {
 
 pub fn ydotool_available() -> bool {
     which("ydotool").is_some()
+}
+
+/// Returns the ydotoold socket path if one exists on disk and is actually a
+/// socket file. Respects `$YDOTOOL_SOCKET`; otherwise checks ydotool's
+/// compiled-in default at `/tmp/.ydotool_socket`.
+///
+/// Note: existence implies the daemon was running at some point. A stale
+/// socket file (daemon died, file left behind) will still pass this check;
+/// keystroke calls will fail at runtime in that case. We accept the false-
+/// positive risk because the diagnostic value of catching the common case
+/// ("user never started ydotoold") outweighs the rare stale-socket case.
+pub fn ydotool_socket_path() -> Option<std::path::PathBuf> {
+    use std::os::unix::fs::FileTypeExt;
+    let candidate = std::env::var_os("YDOTOOL_SOCKET")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp/.ydotool_socket"));
+    let meta = std::fs::metadata(&candidate).ok()?;
+    if meta.file_type().is_socket() {
+        Some(candidate)
+    } else {
+        None
+    }
 }
 
 fn which(prog: &str) -> Option<std::path::PathBuf> {
@@ -113,5 +142,40 @@ mod tests {
         assert_eq!(BackendKind::Enigo.as_str(), "enigo");
         assert_eq!(BackendKind::Clipboard.as_str(), "clipboard");
         assert_eq!(BackendKind::Null.as_str(), "null");
+    }
+
+    // The three socket-detection assertions share the `YDOTOOL_SOCKET` env var,
+    // which is process-global. Keeping them in a single test serializes them
+    // and avoids races under nextest's parallel runner.
+    #[test]
+    fn socket_path_detects_only_real_sockets() {
+        use std::os::unix::net::UnixListener;
+        let dir = tempfile::tempdir().unwrap();
+
+        // Missing path -> None.
+        let missing = dir.path().join("nope");
+        std::env::set_var("YDOTOOL_SOCKET", &missing);
+        assert!(
+            ydotool_socket_path().is_none(),
+            "missing file should be None"
+        );
+
+        // Regular file -> None.
+        let regular = dir.path().join("plain");
+        std::fs::write(&regular, b"").unwrap();
+        std::env::set_var("YDOTOOL_SOCKET", &regular);
+        assert!(
+            ydotool_socket_path().is_none(),
+            "regular file should be None"
+        );
+
+        // Real AF_UNIX socket -> Some.
+        let sock = dir.path().join("real.sock");
+        let _listener = UnixListener::bind(&sock).unwrap();
+        std::env::set_var("YDOTOOL_SOCKET", &sock);
+        let got = ydotool_socket_path();
+        assert_eq!(got, Some(sock), "real socket should be Some");
+
+        std::env::remove_var("YDOTOOL_SOCKET");
     }
 }

@@ -25,7 +25,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-14]
+        os:
+          - ubuntu-latest
+          # - macos-14  # re-enable once macOS build is supported (sherpa-onnx download + rustup setup)
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -33,11 +35,33 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+      # rust-cache restores target/ (including sherpa-rs-sys's build-script
+      # stamp) but the sherpa-onnx download lives in ~/.cache/sherpa-rs/.
+      # Without this, the build script skips re-download and the link fails
+      # with "unable to find library -lonnxruntime".
+      - name: cache sherpa-onnx download
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/sherpa-rs
+          key: sherpa-rs-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            sherpa-rs-${{ runner.os }}-
+      # If the sherpa-onnx download is missing (cache miss or stale rust-cache
+      # restored a target/ with the build-script stamp but no libs), force the
+      # sherpa-rs-sys build script to re-run by cleaning that crate's outputs.
+      - name: ensure sherpa-rs-sys rebuilds when libs are missing
+        run: |
+          if ! find ~/.cache/sherpa-rs -name 'libonnxruntime*' 2>/dev/null | grep -q .; then
+            echo "sherpa-onnx libs missing; cleaning sherpa-rs-sys to force re-download"
+            cargo clean -p sherpa-rs-sys || true
+          else
+            echo "sherpa-onnx libs present in ~/.cache/sherpa-rs"
+          fi
       - name: install linux deps
         if: matrix.os == 'ubuntu-latest'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libasound2-dev libdbus-1-dev
+          sudo apt-get install -y libasound2-dev libdbus-1-dev libxcb1-dev
       - run: cargo clippy --all-targets -- -D warnings
 
   test:
@@ -45,17 +69,37 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-14]
+        os:
+          - ubuntu-latest
+          # - macos-14  # re-enable once macOS build is supported (sherpa-onnx download + rustup setup)
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: cache sherpa-onnx download
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/sherpa-rs
+          key: sherpa-rs-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            sherpa-rs-${{ runner.os }}-
+      # If the sherpa-onnx download is missing (cache miss or stale rust-cache
+      # restored a target/ with the build-script stamp but no libs), force the
+      # sherpa-rs-sys build script to re-run by cleaning that crate's outputs.
+      - name: ensure sherpa-rs-sys rebuilds when libs are missing
+        run: |
+          if ! find ~/.cache/sherpa-rs -name 'libonnxruntime*' 2>/dev/null | grep -q .; then
+            echo "sherpa-onnx libs missing; cleaning sherpa-rs-sys to force re-download"
+            cargo clean -p sherpa-rs-sys || true
+          else
+            echo "sherpa-onnx libs present in ~/.cache/sherpa-rs"
+          fi
       - name: install linux deps
         if: matrix.os == 'ubuntu-latest'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libasound2-dev libdbus-1-dev
+          sudo apt-get install -y libasound2-dev libdbus-1-dev libxcb1-dev
       - name: install nextest
         uses: taiki-e/install-action@nextest
       - run: cargo nextest run

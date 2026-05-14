@@ -59,6 +59,18 @@ impl SessionLimits {
     }
 }
 
+/// Everything `record_and_stream` needs to run one session. Bundling these
+/// keeps the thread-spawn site readable as the recognizer grows knobs.
+struct SessionParams {
+    input_device: String,
+    chunk_samples: usize,
+    silence_threshold_dbfs: f32,
+    limits: SessionLimits,
+    stop: Arc<AtomicBool>,
+    transcriber: SharedTranscriber,
+    backend: SharedBackend,
+}
+
 pub struct Runtime {
     transcriber: SharedTranscriber,
     backend: SharedBackend,
@@ -119,26 +131,18 @@ impl Runtime {
             return;
         }
         let stop = Arc::new(AtomicBool::new(false));
-        let stop_thread = stop.clone();
-        let transcriber = self.transcriber.clone();
-        let backend = self.backend.clone();
-        let input_device = self.input_device.clone();
-        let chunk_samples = self.chunk_samples;
-        let silence_threshold_dbfs = self.silence_threshold_dbfs;
-        let limits = self.limits;
+        let params = SessionParams {
+            input_device: self.input_device.clone(),
+            chunk_samples: self.chunk_samples,
+            silence_threshold_dbfs: self.silence_threshold_dbfs,
+            limits: self.limits,
+            stop: stop.clone(),
+            transcriber: self.transcriber.clone(),
+            backend: self.backend.clone(),
+        };
         let join = thread::Builder::new()
             .name("scribed-session".into())
-            .spawn(move || {
-                record_and_stream(
-                    input_device,
-                    chunk_samples,
-                    silence_threshold_dbfs,
-                    limits,
-                    stop_thread,
-                    transcriber,
-                    backend,
-                );
-            })
+            .spawn(move || record_and_stream(params))
             .expect("spawn session thread");
         self.current_session = Some(SessionHandle {
             stop,
@@ -174,15 +178,16 @@ impl Runtime {
     }
 }
 
-fn record_and_stream(
-    input_device: String,
-    chunk_samples: usize,
-    silence_threshold_dbfs: f32,
-    limits: SessionLimits,
-    stop: Arc<AtomicBool>,
-    transcriber: SharedTranscriber,
-    backend: SharedBackend,
-) {
+fn record_and_stream(params: SessionParams) {
+    let SessionParams {
+        input_device,
+        chunk_samples,
+        silence_threshold_dbfs,
+        limits,
+        stop,
+        transcriber,
+        backend,
+    } = params;
     let input = match audio::resolve_device(&input_device) {
         Ok(i) => i,
         Err(e) => {

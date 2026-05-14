@@ -57,6 +57,23 @@ pub fn start(paths: &Paths, config: &Config, background: bool) -> crate::Result<
     // background and the user loses sight of stderr.
     preflight_warnings(config);
 
+    // Warn the user that startup will block on the model download. After
+    // forking, stderr goes to the daemon log and the indicatif progress bar
+    // disappears with it; users would otherwise see `scribed start
+    // --background` "hang" for ~30-90s on the ~442MB cold fetch.
+    #[cfg(feature = "asr")]
+    if background
+        && !paths
+            .cache_dir
+            .join(crate::asr::download::STREAMING_MODEL.extracted_dir)
+            .exists()
+    {
+        eprintln!(
+            "scribed: ASR model not in cache — first start will download ~442 MB to {}; this may take a minute.",
+            paths.cache_dir.display()
+        );
+    }
+
     if background {
         background_spawn(paths)?;
     } else {

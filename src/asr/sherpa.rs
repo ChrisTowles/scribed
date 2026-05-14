@@ -16,6 +16,11 @@ use crate::asr::driver::{StreamingTranscriber, StreamingUpdate};
 use crate::asr::{AsrError, EndpointRules};
 use crate::audio::SAMPLE_RATE_HZ_I32;
 
+/// Decoding strategy we pass to sherpa-onnx. `modified_beam_search` is the
+/// other option; we use greedy since it's what the upstream Nemotron
+/// example uses and modified-beam-search costs latency.
+const DECODING_METHOD: &str = "greedy_search";
+
 /// File layout for a sherpa-onnx streaming transducer bundle.
 /// `from_dir` auto-detects `encoder*.onnx` / `decoder*.onnx` / `joiner*.onnx`
 /// (preferring `.int8.onnx`), so it works for both canonical-named bundles
@@ -137,7 +142,7 @@ impl SherpaStreamingTranscriber {
         // model_type left None: sherpa-onnx reads it from the encoder ONNX
         // metadata and auto-routes to the Nemo or standard transducer impl
         // based on the decoder's output count.
-        rec_config.decoding_method = Some("greedy_search".to_string());
+        rec_config.decoding_method = Some(DECODING_METHOD.to_string());
         rec_config.max_active_paths = 4;
         rec_config.enable_endpoint = true;
         rec_config.rule1_min_trailing_silence = config.endpoint_rules.rule1_min_trailing_silence;
@@ -199,7 +204,9 @@ impl SherpaStreamingTranscriber {
             Ok(StreamingUpdate::Idle)
         } else {
             tracing::debug!(target: "scribed::asr::sherpa", text = %text, "sherpa partial");
-            self.last_partial_text = text.clone();
+            // Reuse the dedup cache's existing allocation via clone_from
+            // (avoids dropping + allocating fresh each time the partial grows).
+            self.last_partial_text.clone_from(&text);
             Ok(StreamingUpdate::Partial(text))
         }
     }

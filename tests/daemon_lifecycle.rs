@@ -185,3 +185,29 @@ fn double_start_fails_with_already_running() {
 
     scribed(cd).arg("stop").assert().success();
 }
+
+#[test]
+fn run_fails_when_daemon_already_running() {
+    // Regression: previously `scribed run` skipped the pidfile check, so a
+    // user who already had a background daemon up could accidentally spawn a
+    // second one. Two daemons listening on the same hotkey would type into
+    // ydotool concurrently, interleaving keystrokes.
+    let dir = tempdir().unwrap();
+    let cd = dir.path();
+    let _guard = DaemonGuard::new(cd.join("daemon.pid"));
+    scribed(cd)
+        .args(["start", "--background"])
+        .assert()
+        .success();
+    assert!(wait_until(Duration::from_secs(30), || cd
+        .join("daemon.pid")
+        .exists()));
+
+    scribed(cd)
+        .arg("run")
+        .assert()
+        .failure()
+        .stderr(contains("already running"));
+
+    scribed(cd).arg("stop").assert().success();
+}

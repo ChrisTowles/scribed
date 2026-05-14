@@ -45,13 +45,7 @@ pub enum LifecycleError {
 
 /// `scribed start [--background]`.
 pub fn start(paths: &Paths, config: &Config, background: bool) -> crate::Result<()> {
-    if let Some(record) = pidfile::read(&paths.pid_file)? {
-        if liveness::classify(record.pid) == liveness::Liveness::Alive {
-            return Err(LifecycleError::AlreadyRunning { pid: record.pid }.into());
-        }
-        tracing::warn!(pid = record.pid, "removing stale pid file");
-        pidfile::remove(&paths.pid_file)?;
-    }
+    ensure_no_live_daemon(paths)?;
 
     // Surface environment issues to the terminal before we fork into the
     // background and the user loses sight of stderr.
@@ -78,6 +72,20 @@ pub fn start(paths: &Paths, config: &Config, background: bool) -> crate::Result<
         background_spawn(paths)?;
     } else {
         run_foreground(paths, config)?;
+    }
+    Ok(())
+}
+
+/// Refuse to proceed if a live daemon already owns `paths.pid_file`. Clears
+/// stale pidfiles (where the recorded pid no longer exists) so a crashed
+/// previous daemon doesn't permanently lock the user out.
+fn ensure_no_live_daemon(paths: &Paths) -> crate::Result<()> {
+    if let Some(record) = pidfile::read(&paths.pid_file)? {
+        if liveness::classify(record.pid) == liveness::Liveness::Alive {
+            return Err(LifecycleError::AlreadyRunning { pid: record.pid }.into());
+        }
+        tracing::warn!(pid = record.pid, "removing stale pid file");
+        pidfile::remove(&paths.pid_file)?;
     }
     Ok(())
 }
@@ -182,6 +190,13 @@ pub fn status(paths: &Paths, config: &Config) -> crate::Result<()> {
 /// `scribed run`. The daemon's main loop. Called directly when running in the
 /// foreground, or by the spawned child after `--background` forks.
 pub fn run_foreground(paths: &Paths, config: &Config) -> crate::Result<()> {
+    // Refuse to start if another daemon is already alive — otherwise both
+    // would listen on the same hotkey and type into ydotool concurrently,
+    // interleaving keystrokes character-by-character. The `start` entry
+    // point does this check too, but `scribed run` invoked directly would
+    // otherwise skip it.
+    ensure_no_live_daemon(paths)?;
+
     let record = PidRecord {
         pid: std::process::id() as i32,
         command: "scribed run".into(),

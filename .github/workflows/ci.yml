@@ -35,6 +35,17 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+      # rust-cache restores target/ (including sherpa-rs-sys's build-script
+      # stamp) but the sherpa-onnx download lives in ~/.cache/sherpa-rs/.
+      # Without this, the build script skips re-download and the link fails
+      # with "unable to find library -lonnxruntime".
+      - name: cache sherpa-onnx download
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/sherpa-rs
+          key: sherpa-rs-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            sherpa-rs-${{ runner.os }}-
       - name: install linux deps
         if: matrix.os == 'ubuntu-latest'
         run: |
@@ -55,6 +66,13 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: cache sherpa-onnx download
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/sherpa-rs
+          key: sherpa-rs-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            sherpa-rs-${{ runner.os }}-
       - name: install linux deps
         if: matrix.os == 'ubuntu-latest'
         run: |

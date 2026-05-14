@@ -9,7 +9,7 @@
 //! Mirrors `claude_stt/keyboard.py:58-156`.
 
 use std::io;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use crate::output::retype::{KeyboardSink, RetypeStep};
 
@@ -27,6 +27,8 @@ impl YdotoolBackend {
         }
         let status = Command::new("ydotool")
             .args(["type", "--key-delay", "2", "--", text])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .status()?;
         if !status.success() {
             return Err(io::Error::other(format!("ydotool type exited {status}")));
@@ -46,7 +48,11 @@ impl YdotoolBackend {
             args.push("14:1".into());
             args.push("14:0".into());
         }
-        let status = Command::new("ydotool").args(&args).status()?;
+        let status = Command::new("ydotool")
+            .args(&args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()?;
         if !status.success() {
             return Err(io::Error::other(format!("ydotool key exited {status}")));
         }

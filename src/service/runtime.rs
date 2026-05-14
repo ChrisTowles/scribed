@@ -130,19 +130,36 @@ fn record_and_stream(
 
     let mut driver = StreamingDriver::new(driver_config);
     let mut retype = RetypeState::new();
+    // Coalesce partials so we don't spawn a ydotool subprocess per chunk
+    // (~3 Hz at default config). The freshest pending transcript wins.
+    let mut pending: Option<Transcript> = None;
+    let mut last_apply: Option<Instant> = None;
+    const PARTIAL_DEBOUNCE: Duration = Duration::from_millis(200);
 
     while !stop.load(Ordering::SeqCst) {
         match rx.recv_timeout(Duration::from_millis(50)) {
-            Ok(chunk) => process_chunk(&chunk, &mut driver, &mut retype, &transcriber, &backend),
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+            Ok(chunk) => {
+                if let Some(t) = transcribe_chunk(&chunk, &mut driver, &transcriber) {
+                    pending = Some(t);
+                }
+            }
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+        }
+        if pending.is_some() && last_apply.map_or(true, |i| i.elapsed() >= PARTIAL_DEBOUNCE) {
+            let t = pending.take().unwrap();
+            apply_transcript(&t, &mut retype, &backend);
+            last_apply = Some(Instant::now());
         }
     }
 
     drop(stream);
 
+    // Drain any chunks captured between the stop signal and stream teardown.
+    // We discard `pending` here — finalize() will produce the authoritative
+    // transcript and apply_transcript will diff to it directly.
     while let Ok(chunk) = rx.try_recv() {
-        process_chunk(&chunk, &mut driver, &mut retype, &transcriber, &backend);
+        let _ = transcribe_chunk(&chunk, &mut driver, &transcriber);
     }
 
     let mut tr = transcriber.lock();
@@ -156,20 +173,20 @@ fn record_and_stream(
     }
 }
 
-fn process_chunk(
+fn transcribe_chunk(
     chunk: &[f32],
     driver: &mut StreamingDriver,
-    retype: &mut RetypeState,
     transcriber: &Arc<Mutex<SherpaTranscriber>>,
-    backend: &Arc<Mutex<Box<dyn KeyboardSink + Send>>>,
-) {
+) -> Option<Transcript> {
     let mut tr = transcriber.lock();
     let outcome = driver.ingest(chunk, &mut *tr);
     drop(tr);
     match outcome {
-        Ok(Some(transcript)) => apply_transcript(&transcript, retype, backend),
-        Ok(None) => {}
-        Err(e) => tracing::error!(?e, "ingest failed"),
+        Ok(maybe) => maybe,
+        Err(e) => {
+            tracing::error!(?e, "ingest failed");
+            None
+        }
     }
 }
 

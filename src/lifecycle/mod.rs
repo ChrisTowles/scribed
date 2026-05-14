@@ -57,6 +57,23 @@ pub fn start(paths: &Paths, config: &Config, background: bool) -> crate::Result<
     // background and the user loses sight of stderr.
     preflight_warnings(config);
 
+    // Warn the user that startup will block on the model download. After
+    // forking, stderr goes to the daemon log and the indicatif progress bar
+    // disappears with it; users would otherwise see `scribed start
+    // --background` "hang" for ~30-90s on the ~442MB cold fetch.
+    #[cfg(feature = "asr")]
+    if background
+        && !paths
+            .cache_dir
+            .join(crate::asr::download::STREAMING_MODEL.extracted_dir)
+            .exists()
+    {
+        eprintln!(
+            "scribed: ASR model not in cache — first start will download ~442 MB to {}; this may take a minute.",
+            paths.cache_dir.display()
+        );
+    }
+
     if background {
         background_spawn(paths)?;
     } else {
@@ -132,7 +149,7 @@ pub fn status(paths: &Paths, config: &Config) -> crate::Result<()> {
     println!("  mode       : {:?}", config.mode);
     println!(
         "  model      : {}",
-        crate::asr::download::STREAMING_ZIPFORMER_EN.name
+        crate::asr::download::STREAMING_MODEL.name
     );
     println!(
         "  output     : {}",
@@ -241,9 +258,9 @@ fn background_spawn(paths: &Paths) -> crate::Result<()> {
     tracing::info!(pid = child_pid, "spawned background daemon");
 
     // Poll the pid file briefly to confirm the child wrote its identity.
-    // Model load takes a few seconds, so we give it more headroom than the
-    // pure-IPC daemon needed.
-    let deadline = Instant::now() + Duration::from_secs(10);
+    // Model load + (on cold cache) model fetch takes time — on a slow runner
+    // the ~442 MB download can run for ~30 s, so we give plenty of headroom.
+    let deadline = Instant::now() + Duration::from_secs(120);
     while Instant::now() < deadline {
         if let Ok(Some(_)) = pidfile::read(&paths.pid_file) {
             println!("scribed: started (pid {child_pid})");
@@ -263,20 +280,12 @@ fn background_spawn(paths: &Paths) -> crate::Result<()> {
 fn run_loop(paths: &Paths, config: &Config) -> crate::Result<()> {
     #[cfg(feature = "asr")]
     let runtime: Option<Arc<Mutex<crate::service::Runtime>>> = {
-        let model_dir = paths
-            .cache_dir
-            .join(crate::asr::download::STREAMING_ZIPFORMER_EN.extracted_dir);
-        match crate::service::Runtime::load(config, model_dir.clone()) {
-            Ok(rt) => Some(Arc::new(Mutex::new(rt))),
-            Err(e) => {
-                tracing::warn!(
-                    ?e,
-                    dir = %model_dir.display(),
-                    "ASR runtime disabled — hotkey will toggle state but no transcription will run. Run `scribed fetch-model` to enable."
-                );
-                None
-            }
-        }
+        let model_dir =
+            crate::asr::download::ensure(&crate::asr::download::STREAMING_MODEL, &paths.cache_dir)
+                .map_err(|e| anyhow::anyhow!("fetch ASR model: {e}"))?;
+        let rt = crate::service::Runtime::load(config, model_dir.clone())
+            .map_err(|e| anyhow::anyhow!("load ASR model from {}: {e}", model_dir.display()))?;
+        Some(Arc::new(Mutex::new(rt)))
     };
 
     let rt = tokio::runtime::Builder::new_multi_thread()

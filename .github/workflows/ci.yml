@@ -35,28 +35,6 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      # rust-cache restores target/ (including sherpa-rs-sys's build-script
-      # stamp) but the sherpa-onnx download lives in ~/.cache/sherpa-rs/.
-      # Without this, the build script skips re-download and the link fails
-      # with "unable to find library -lonnxruntime".
-      - name: cache sherpa-onnx download
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/sherpa-rs
-          key: sherpa-rs-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            sherpa-rs-${{ runner.os }}-
-      # If the sherpa-onnx download is missing (cache miss or stale rust-cache
-      # restored a target/ with the build-script stamp but no libs), force the
-      # sherpa-rs-sys build script to re-run by cleaning that crate's outputs.
-      - name: ensure sherpa-rs-sys rebuilds when libs are missing
-        run: |
-          if ! find ~/.cache/sherpa-rs -name 'libonnxruntime*' 2>/dev/null | grep -q .; then
-            echo "sherpa-onnx libs missing; cleaning sherpa-rs-sys to force re-download"
-            cargo clean -p sherpa-rs-sys || true
-          else
-            echo "sherpa-onnx libs present in ~/.cache/sherpa-rs"
-          fi
       - name: install linux deps
         if: matrix.os == 'ubuntu-latest'
         run: |
@@ -77,24 +55,19 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: cache sherpa-onnx download
+      # sherpa-onnx-sys's build script downloads prebuilt native libs into
+      # target/<profile>/sherpa-onnx-prebuilt/. rust-cache covers that path.
+      # Daemon `run` fetches the streaming Nemotron bundle on startup
+      # (~442MB int8). Cache the model dir so the daemon_lifecycle integration
+      # test reuses the download across runs. Key on the bundle name so a
+      # future model bump invalidates the cache.
+      - name: cache scribed ASR model
         uses: actions/cache@v4
         with:
-          path: ~/.cache/sherpa-rs
-          key: sherpa-rs-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          path: ~/.cache/scribed
+          key: scribed-model-${{ runner.os }}-sherpa-onnx-nemotron-speech-streaming-en-0.6b-80ms-int8-2026-04-25
           restore-keys: |
-            sherpa-rs-${{ runner.os }}-
-      # If the sherpa-onnx download is missing (cache miss or stale rust-cache
-      # restored a target/ with the build-script stamp but no libs), force the
-      # sherpa-rs-sys build script to re-run by cleaning that crate's outputs.
-      - name: ensure sherpa-rs-sys rebuilds when libs are missing
-        run: |
-          if ! find ~/.cache/sherpa-rs -name 'libonnxruntime*' 2>/dev/null | grep -q .; then
-            echo "sherpa-onnx libs missing; cleaning sherpa-rs-sys to force re-download"
-            cargo clean -p sherpa-rs-sys || true
-          else
-            echo "sherpa-onnx libs present in ~/.cache/sherpa-rs"
-          fi
+            scribed-model-${{ runner.os }}-
       - name: install linux deps
         if: matrix.os == 'ubuntu-latest'
         run: |
@@ -102,21 +75,10 @@ jobs:
           sudo apt-get install -y libasound2-dev libdbus-1-dev libxcb1-dev
       - name: install nextest
         uses: taiki-e/install-action@nextest
-      # sherpa-rs-sys's build script copies libsherpa-onnx-c-api.so into
-      # target/<profile>/ so the binary's $ORIGIN rpath finds it. On a
-      # cache-hit build the script doesn't re-run, the .so isn't copied,
-      # and integration tests that exec the binary fail with "cannot open
-      # shared object file". Export LD_LIBRARY_PATH from the cached
-      # sherpa-rs download dir as a fallback.
-      - name: export sherpa-onnx LD_LIBRARY_PATH
-        run: |
-          SHERPA_LIB=$(find ~/.cache/sherpa-rs -name 'libsherpa-onnx-c-api.so' -exec dirname {} \; | head -1)
-          if [ -n "$SHERPA_LIB" ]; then
-            echo "LD_LIBRARY_PATH=$SHERPA_LIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
-            echo "exported LD_LIBRARY_PATH=$SHERPA_LIB"
-          else
-            echo "warning: no libsherpa-onnx-c-api.so found in ~/.cache/sherpa-rs"
-          fi
+      # Pre-fetch the ASR model so the daemon_lifecycle integration test
+      # doesn't time out waiting for the ~442MB download. On cache hit this
+      # is a few-ms no-op; on cache miss it primes the cache for future runs.
+      - run: cargo run --release --bin scribed -- fetch-model
       - run: cargo nextest run
       - run: cargo test --doc
 

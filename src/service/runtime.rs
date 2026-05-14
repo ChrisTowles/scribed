@@ -17,7 +17,7 @@ use parking_lot::Mutex;
 
 use crate::asr::sherpa::{ModelBundle, SherpaStreamingTranscriber, StreamingConfig};
 use crate::asr::{AsrError, StreamingDriver, StreamingTranscriber, Transcript};
-use crate::audio::{self, AudioChunk, SAMPLE_RATE_HZ};
+use crate::audio::{self, dsp::rms_dbfs, AudioChunk, SAMPLE_RATE_HZ};
 use crate::config::Config;
 use crate::output::backend;
 use crate::output::retype::{KeyboardSink, RetypeState};
@@ -59,11 +59,24 @@ impl SessionLimits {
     }
 }
 
+/// Everything `record_and_stream` needs to run one session. Bundling these
+/// keeps the thread-spawn site readable as the recognizer grows knobs.
+struct SessionParams {
+    input_device: String,
+    chunk_samples: usize,
+    silence_threshold_dbfs: f32,
+    limits: SessionLimits,
+    stop: Arc<AtomicBool>,
+    transcriber: SharedTranscriber,
+    backend: SharedBackend,
+}
+
 pub struct Runtime {
     transcriber: SharedTranscriber,
     backend: SharedBackend,
     input_device: String,
     chunk_samples: usize,
+    silence_threshold_dbfs: f32,
     limits: SessionLimits,
     current_session: Option<SessionHandle>,
 }
@@ -89,6 +102,7 @@ impl Runtime {
             backend: Arc::new(Mutex::new(backend)),
             input_device: config.input_device.clone(),
             chunk_samples: config.chunk_samples(SAMPLE_RATE_HZ),
+            silence_threshold_dbfs: config.silence_threshold_dbfs,
             limits: SessionLimits::from_config(config),
             current_session: None,
         })
@@ -117,24 +131,18 @@ impl Runtime {
             return;
         }
         let stop = Arc::new(AtomicBool::new(false));
-        let stop_thread = stop.clone();
-        let transcriber = self.transcriber.clone();
-        let backend = self.backend.clone();
-        let input_device = self.input_device.clone();
-        let chunk_samples = self.chunk_samples;
-        let limits = self.limits;
+        let params = SessionParams {
+            input_device: self.input_device.clone(),
+            chunk_samples: self.chunk_samples,
+            silence_threshold_dbfs: self.silence_threshold_dbfs,
+            limits: self.limits,
+            stop: stop.clone(),
+            transcriber: self.transcriber.clone(),
+            backend: self.backend.clone(),
+        };
         let join = thread::Builder::new()
             .name("scribed-session".into())
-            .spawn(move || {
-                record_and_stream(
-                    input_device,
-                    chunk_samples,
-                    limits,
-                    stop_thread,
-                    transcriber,
-                    backend,
-                );
-            })
+            .spawn(move || record_and_stream(params))
             .expect("spawn session thread");
         self.current_session = Some(SessionHandle {
             stop,
@@ -170,14 +178,16 @@ impl Runtime {
     }
 }
 
-fn record_and_stream(
-    input_device: String,
-    chunk_samples: usize,
-    limits: SessionLimits,
-    stop: Arc<AtomicBool>,
-    transcriber: SharedTranscriber,
-    backend: SharedBackend,
-) {
+fn record_and_stream(params: SessionParams) {
+    let SessionParams {
+        input_device,
+        chunk_samples,
+        silence_threshold_dbfs,
+        limits,
+        stop,
+        transcriber,
+        backend,
+    } = params;
     let input = match audio::resolve_device(&input_device) {
         Ok(i) => i,
         Err(e) => {
@@ -239,29 +249,31 @@ fn record_and_stream(
         }
 
         match rx.recv_timeout(Duration::from_millis(50)) {
-            Ok(chunk) => match ingest_chunk(&chunk, &mut driver, &transcriber) {
-                Ok(Some(t)) => {
-                    consecutive_errors = 0;
-                    if t.committed.len() != last_committed_count {
-                        last_committed_count = t.committed.len();
-                        last_committed_change = Instant::now();
+            Ok(chunk) => {
+                match gate_and_ingest(chunk, silence_threshold_dbfs, &mut driver, &transcriber) {
+                    Ok(Some(t)) => {
+                        consecutive_errors = 0;
+                        if t.committed.len() != last_committed_count {
+                            last_committed_count = t.committed.len();
+                            last_committed_change = Instant::now();
+                        }
+                        pending = Some(t);
                     }
-                    pending = Some(t);
-                }
-                Ok(None) => {
-                    consecutive_errors = 0;
-                }
-                Err(()) => {
-                    consecutive_errors += 1;
-                    if consecutive_errors >= MAX_CONSECUTIVE_INGEST_ERRORS {
-                        tracing::error!(
-                            count = consecutive_errors,
-                            "consecutive ingest errors exceeded threshold; aborting session"
-                        );
-                        break;
+                    Ok(None) => {
+                        consecutive_errors = 0;
+                    }
+                    Err(()) => {
+                        consecutive_errors += 1;
+                        if consecutive_errors >= MAX_CONSECUTIVE_INGEST_ERRORS {
+                            tracing::error!(
+                                count = consecutive_errors,
+                                "consecutive ingest errors exceeded threshold; aborting session"
+                            );
+                            break;
+                        }
                     }
                 }
-            },
+            }
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
         }
@@ -278,7 +290,7 @@ fn record_and_stream(
     // teardown. We discard `pending` because finalize() will produce the
     // authoritative end-of-session transcript anyway.
     while let Ok(chunk) = rx.try_recv() {
-        let _ = ingest_chunk(&chunk, &mut driver, &transcriber);
+        let _ = gate_and_ingest(chunk, silence_threshold_dbfs, &mut driver, &transcriber);
     }
 
     let mut tr = transcriber.lock();
@@ -291,6 +303,29 @@ fn record_and_stream(
         }
         Err(e) => tracing::error!(?e, "finalize failed"),
     }
+}
+
+/// Pre-recognizer noise gate. Zero-fills the chunk if its RMS sits below
+/// `threshold_dbfs`. Feeding zeros (rather than skipping the chunk) keeps
+/// sherpa-onnx's feature stream advancing in lockstep with wall-clock time,
+/// so the internal endpoint detector still counts trailing silence correctly.
+fn gate_chunk(chunk: &mut [f32], threshold_dbfs: f32) {
+    if rms_dbfs(chunk) < threshold_dbfs {
+        chunk.fill(0.0);
+    }
+}
+
+/// Apply the noise gate to `chunk` and feed it to the recognizer. Used in
+/// both the main session loop and the post-stop drain — keeps the
+/// gate-before-ingest contract in one place.
+fn gate_and_ingest(
+    mut chunk: AudioChunk,
+    threshold_dbfs: f32,
+    driver: &mut StreamingDriver,
+    transcriber: &SharedTranscriber,
+) -> Result<Option<Transcript>, ()> {
+    gate_chunk(&mut chunk, threshold_dbfs);
+    ingest_chunk(&chunk, driver, transcriber)
 }
 
 /// Returns `Ok(Some(t))` if the transcript changed, `Ok(None)` for a clean
@@ -331,5 +366,35 @@ fn apply_transcript(transcript: &Transcript, retype: &mut RetypeState, backend: 
         );
         *retype = snapshot;
         retype.reset();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gate_zeros_sub_threshold_chunk() {
+        // Half-amplitude DC sits at 0 dBFS-ish (actually -6), well above -28.
+        // A very small constant signal is far below -28 and should be zeroed.
+        let mut quiet = vec![0.001_f32; 1024];
+        gate_chunk(&mut quiet, -28.0);
+        assert!(quiet.iter().all(|&s| s == 0.0));
+    }
+
+    #[test]
+    fn gate_passes_above_threshold_chunk() {
+        let mut loud = vec![0.5_f32; 1024];
+        gate_chunk(&mut loud, -28.0);
+        assert!(loud.iter().all(|&s| s == 0.5));
+    }
+
+    #[test]
+    fn gate_at_threshold_floor_passes_a_quiet_signal() {
+        // 0.0001 amplitude → RMS ≈ -80 dBFS, which is above the -90 dBFS
+        // floor, so even the floor-most threshold lets it through.
+        let mut whisper = vec![0.0001_f32; 1024];
+        gate_chunk(&mut whisper, -90.0);
+        assert!(whisper.iter().all(|&s| s == 0.0001));
     }
 }

@@ -132,7 +132,7 @@ pub fn status(paths: &Paths, config: &Config) -> crate::Result<()> {
     println!("  mode       : {:?}", config.mode);
     println!(
         "  model      : {}",
-        crate::asr::download::STREAMING_ZIPFORMER_EN.name
+        crate::asr::download::STREAMING_MODEL.name
     );
     println!(
         "  output     : {}",
@@ -263,20 +263,14 @@ fn background_spawn(paths: &Paths) -> crate::Result<()> {
 fn run_loop(paths: &Paths, config: &Config) -> crate::Result<()> {
     #[cfg(feature = "asr")]
     let runtime: Option<Arc<Mutex<crate::service::Runtime>>> = {
-        let model_dir = paths
-            .cache_dir
-            .join(crate::asr::download::STREAMING_ZIPFORMER_EN.extracted_dir);
-        match crate::service::Runtime::load(config, model_dir.clone()) {
-            Ok(rt) => Some(Arc::new(Mutex::new(rt))),
-            Err(e) => {
-                tracing::warn!(
-                    ?e,
-                    dir = %model_dir.display(),
-                    "ASR runtime disabled — hotkey will toggle state but no transcription will run. Run `scribed fetch-model` to enable."
-                );
-                None
-            }
-        }
+        let model_dir = crate::asr::download::ensure(
+            &crate::asr::download::STREAMING_MODEL,
+            &paths.cache_dir,
+        )
+        .map_err(|e| anyhow::anyhow!("fetch ASR model: {e}"))?;
+        let rt = crate::service::Runtime::load(config, model_dir.clone())
+            .map_err(|e| anyhow::anyhow!("load ASR model from {}: {e}", model_dir.display()))?;
+        Some(Arc::new(Mutex::new(rt)))
     };
 
     let rt = tokio::runtime::Builder::new_multi_thread()

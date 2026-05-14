@@ -23,7 +23,7 @@ fn main() {
 
 #[cfg(feature = "asr")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    use scribed::asr::download::STREAMING_ZIPFORMER_EN;
+    use scribed::asr::download::STREAMING_MODEL;
     use scribed::asr::sherpa::{ModelBundle, SherpaStreamingTranscriber, StreamingConfig};
     use scribed::asr::StreamingDriver;
     use scribed::audio::SAMPLE_RATE_HZ;
@@ -41,7 +41,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         PathBuf::from(args.get(i + 1).ok_or("missing model-dir value")?)
     } else {
         let paths = Paths::from_env();
-        paths.cache_dir.join(STREAMING_ZIPFORMER_EN.extracted_dir)
+        paths.cache_dir.join(STREAMING_MODEL.extracted_dir)
     };
     let print_partials = args.iter().any(|a| a == "--partials");
 

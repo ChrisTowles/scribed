@@ -13,10 +13,8 @@ categories = ["command-line-utilities", "multimedia::audio"]
 [features]
 default = ["asr"]
 # Compile the ASR engine. Disable with `--no-default-features` if the
-# sherpa-onnx native library isn't installed (e.g. quick `cargo check`).
-asr = ["dep:sherpa-rs"]
-# Build sherpa-onnx with CUDA execution provider. Requires CUDA 12.x toolkit.
-cuda = ["asr", "sherpa-rs/cuda"]
+# sherpa-onnx native library isn't available at build time.
+asr = ["dep:sherpa-onnx"]
 
 [dependencies]
 anyhow = "1"
@@ -49,11 +47,13 @@ rodio = { version = "0.19", default-features = false, features = ["vorbis"] }
 indicatif = "0.17"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "stream"] }
 
-# Optional ASR backend. default-features = false drops sherpa-rs's `tts`
-# default (unused here); `download-binaries` and `sys` we keep explicitly.
-# `sys` re-exports `sherpa_rs_sys` so we can reach the OnlineRecognizer C API
-# (no high-level Rust wrapper exists for streaming).
-sherpa-rs = { version = "0.6", default-features = false, features = ["download-binaries", "sys"], optional = true }
+# Optional ASR backend. The official `sherpa-onnx` crate (Apache-2.0)
+# replaced the deprecated `sherpa-rs` (deprecation notice March 2026); it
+# tracks the C++ sherpa-onnx project version-for-version. Version 1.13.x
+# is the minimum that supports the streaming Nemotron 2026-04-25 bundle.
+# `static` statically links sherpa-onnx; the build script downloads
+# prebuilt libs from GitHub Releases on first build.
+sherpa-onnx = { version = "1.13", default-features = false, features = ["static"], optional = true }
 
 # Used by the transcribe_wav smoke-test binary (feature = "asr")
 hound = "3"

@@ -21,11 +21,20 @@ pub struct ModelArchive {
     pub extracted_dir: &'static str,
 }
 
-/// Streaming Zipformer English transducer (k2-fsa, LibriSpeech, RNN-T, 16 kHz).
-pub const STREAMING_ZIPFORMER_EN: ModelArchive = ModelArchive {
-    name: "streaming-zipformer-en-2023-06-26",
-    url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-streaming-zipformer-en-2023-06-26.tar.bz2",
-    extracted_dir: "sherpa-onnx-streaming-zipformer-en-2023-06-26",
+/// NVIDIA Nemotron streaming 0.6B (FastConformer-CacheAware-RNNT, 80 ms chunk,
+/// int8 quantized, 16 kHz). Trained on ~530k hours; emits mixed-case text with
+/// native punctuation. ~442 MB download. NVIDIA Open Model License.
+///
+/// The 80 ms chunk is the smallest-latency variant — partials land sub-100 ms
+/// after audio, matching the live-dictation feel of the previous LibriSpeech
+/// Zipformer. The 560 ms / 1120 ms bundles trade interactive feel for marginal
+/// accuracy gains; if dictation feels too laggy on slower hardware, swap to a
+/// larger chunk by changing `url` + `extracted_dir` (cache key in CI follows
+/// the bundle name).
+pub const STREAMING_MODEL: ModelArchive = ModelArchive {
+    name: "nemotron-streaming-en-0.6b-80ms-int8-2026-04-25",
+    url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemotron-speech-streaming-en-0.6b-80ms-int8-2026-04-25.tar.bz2",
+    extracted_dir: "sherpa-onnx-nemotron-speech-streaming-en-0.6b-80ms-int8-2026-04-25",
 };
 
 /// Ensure the named model exists locally. Returns the directory containing the
@@ -108,9 +117,9 @@ mod tests {
     #[test]
     fn ensure_returns_cached_path_without_network() {
         let dir = tempdir().unwrap();
-        let prebuilt = dir.path().join(STREAMING_ZIPFORMER_EN.extracted_dir);
+        let prebuilt = dir.path().join(STREAMING_MODEL.extracted_dir);
         fs::create_dir_all(&prebuilt).unwrap();
-        let result = ensure(&STREAMING_ZIPFORMER_EN, dir.path()).unwrap();
+        let result = ensure(&STREAMING_MODEL, dir.path()).unwrap();
         assert_eq!(result, prebuilt);
     }
 }

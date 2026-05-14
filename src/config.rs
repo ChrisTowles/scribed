@@ -70,6 +70,14 @@ pub struct Config {
     /// Endpoint rule 3: hard ceiling on a single utterance in seconds.
     /// Clamp: [1.0, 600.0].
     pub endpoint_rule3_max_utterance_seconds: f32,
+    /// Pre-recognizer noise gate. Chunks whose RMS energy is below this
+    /// dBFS value are zero-filled before being fed to the streaming
+    /// recognizer, so background noise cannot trigger token emission.
+    /// Lower = more permissive (catches softer speech, lets more noise
+    /// through); higher = stricter. Typical room ambient sits around
+    /// -40 to -50 dBFS; normal speech at a close mic is -15 to -25 dBFS.
+    /// Clamp: [-90.0, 0.0]. Set to -90.0 (or lower) to disable.
+    pub silence_threshold_dbfs: f32,
     /// Output strategy.
     pub output_mode: OutputMode,
     /// Play start/stop/warning sounds.
@@ -93,6 +101,7 @@ impl Default for Config {
             endpoint_rule1_silence_seconds: 2.4,
             endpoint_rule2_silence_seconds: 1.0,
             endpoint_rule3_max_utterance_seconds: 20.0,
+            silence_threshold_dbfs: -28.0,
             output_mode: OutputMode::Auto,
             sound_effects: true,
             soft_newlines: true,
@@ -190,6 +199,7 @@ impl Config {
             clamp_f32(self.endpoint_rule2_silence_seconds, 0.1, 60.0);
         self.endpoint_rule3_max_utterance_seconds =
             clamp_f32(self.endpoint_rule3_max_utterance_seconds, 5.0, 600.0);
+        self.silence_threshold_dbfs = clamp_f32(self.silence_threshold_dbfs, -90.0, 0.0);
         self
     }
 
@@ -212,10 +222,6 @@ impl Config {
 /// longer reads. We don't error on them (serde silently ignores unknown keys)
 /// but we warn so an upgrading user knows their tuning has been dropped.
 const STALE_SCRIBED_KEYS: &[(&str, &str)] = &[
-    (
-        "silence_threshold_dbfs",
-        "energy-based silence gate removed; endpoint detection now lives inside sherpa-onnx (see endpoint_rule1/2/3_*)",
-    ),
     (
         "silence_reset_seconds",
         "replaced by endpoint_rule2_silence_seconds",
@@ -270,6 +276,7 @@ mod tests {
         assert_eq!(c.endpoint_rule1_silence_seconds, 2.4);
         assert_eq!(c.endpoint_rule2_silence_seconds, 1.0);
         assert_eq!(c.endpoint_rule3_max_utterance_seconds, 20.0);
+        assert_eq!(c.silence_threshold_dbfs, -28.0);
         assert_eq!(c.max_recording_seconds, 300);
         assert_eq!(c.silence_auto_stop_seconds, 60);
         assert!(c.sound_effects);
@@ -293,6 +300,30 @@ mod tests {
         assert_eq!(c.endpoint_rule2_silence_seconds, 60.0);
         assert_eq!(c.endpoint_rule3_max_utterance_seconds, 5.0);
         assert_eq!(c.max_recording_seconds, 10);
+    }
+
+    #[test]
+    fn sanitize_clamps_silence_threshold_dbfs() {
+        let too_low = Config {
+            silence_threshold_dbfs: -500.0,
+            ..Config::default()
+        }
+        .sanitize();
+        assert_eq!(too_low.silence_threshold_dbfs, -90.0);
+
+        let too_high = Config {
+            silence_threshold_dbfs: 12.0,
+            ..Config::default()
+        }
+        .sanitize();
+        assert_eq!(too_high.silence_threshold_dbfs, 0.0);
+
+        let nan = Config {
+            silence_threshold_dbfs: f32::NAN,
+            ..Config::default()
+        }
+        .sanitize();
+        assert_eq!(nan.silence_threshold_dbfs, -90.0);
     }
 
     #[test]
@@ -328,7 +359,6 @@ mod tests {
             r#"
 [scribed]
 hotkey = "ctrl+shift+space"
-silence_threshold_dbfs = -45.0
 silence_reset_seconds = 1.5
 context_seconds = 30.0
 model = "nvidia/parakeet-tdt-0.6b-v2"

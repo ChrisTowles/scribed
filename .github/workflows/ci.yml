@@ -102,6 +102,21 @@ jobs:
           sudo apt-get install -y libasound2-dev libdbus-1-dev libxcb1-dev
       - name: install nextest
         uses: taiki-e/install-action@nextest
+      # sherpa-rs-sys's build script copies libsherpa-onnx-c-api.so into
+      # target/<profile>/ so the binary's $ORIGIN rpath finds it. On a
+      # cache-hit build the script doesn't re-run, the .so isn't copied,
+      # and integration tests that exec the binary fail with "cannot open
+      # shared object file". Export LD_LIBRARY_PATH from the cached
+      # sherpa-rs download dir as a fallback.
+      - name: export sherpa-onnx LD_LIBRARY_PATH
+        run: |
+          SHERPA_LIB=$(find ~/.cache/sherpa-rs -name 'libsherpa-onnx-c-api.so' -exec dirname {} \; | head -1)
+          if [ -n "$SHERPA_LIB" ]; then
+            echo "LD_LIBRARY_PATH=$SHERPA_LIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
+            echo "exported LD_LIBRARY_PATH=$SHERPA_LIB"
+          else
+            echo "warning: no libsherpa-onnx-c-api.so found in ~/.cache/sherpa-rs"
+          fi
       - run: cargo nextest run
       - run: cargo test --doc
 

@@ -85,7 +85,7 @@ impl Default for Config {
             input_device: String::new(),
             chunk_ms: 320,
             context_seconds: 30.0,
-            silence_threshold_dbfs: -45.0,
+            silence_threshold_dbfs: -32.0,
             silence_reset_seconds: 1.5,
             max_recording_seconds: 300,
             silence_auto_stop_seconds: 60,
@@ -212,13 +212,17 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn defaults_match_python_claude_stt() {
+    fn default_values_are_documented() {
         let c = Config::default();
         assert_eq!(c.hotkey, "ctrl+shift+space");
         assert_eq!(c.mode, TriggerMode::Toggle);
         assert_eq!(c.chunk_ms, 320);
         assert_eq!(c.context_seconds, 30.0);
-        assert_eq!(c.silence_threshold_dbfs, -45.0);
+        // -32 dBFS rejects typical room ambient (-40 to -50 dBFS) without
+        // clipping normal speech (-15 to -25 dBFS at a close mic). Diverges
+        // from the Python claude_stt default of -45 dBFS, which let too much
+        // background noise through and made the model hallucinate filler text.
+        assert_eq!(c.silence_threshold_dbfs, -32.0);
         assert_eq!(c.silence_reset_seconds, 1.5);
         assert_eq!(c.max_recording_seconds, 300);
         assert_eq!(c.silence_auto_stop_seconds, 60);

@@ -1,13 +1,19 @@
-//! End-to-end smoke test: load Parakeet via sherpa-rs and transcribe a WAV.
+//! End-to-end smoke test: load the streaming ASR model via sherpa-rs and
+//! transcribe a WAV by feeding all samples through the streaming recognizer
+//! in chunks, then collecting the final transcript.
 //!
 //! Usage:
 //!
 //! ```text
-//! transcribe_wav <wav-path> [--model-dir DIR]
+//! transcribe_wav <wav-path> [--model-dir DIR] [--partials]
 //! ```
 //!
-//! If no model directory is supplied, defaults to the cached
-//! `parakeet-tdt-0.6b-v2` bundle under `~/.cache/scribed/`.
+//! `--partials` streams each transcript update to stdout as it lands, letting
+//! an agent or human observe the live-partial behavior end-to-end without
+//! running the daemon against a microphone.
+//!
+//! If no model directory is supplied, defaults to the cached streaming
+//! Zipformer bundle under `~/.cache/scribed/`.
 
 #[cfg(not(feature = "asr"))]
 fn main() {
@@ -17,8 +23,10 @@ fn main() {
 
 #[cfg(feature = "asr")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    use scribed::asr::driver::Transcriber;
-    use scribed::asr::sherpa::{ModelBundle, SherpaTranscriber};
+    use scribed::asr::download::STREAMING_ZIPFORMER_EN;
+    use scribed::asr::sherpa::{ModelBundle, SherpaStreamingTranscriber, StreamingConfig};
+    use scribed::asr::StreamingDriver;
+    use scribed::audio::SAMPLE_RATE_HZ;
     use scribed::paths::Paths;
     use std::path::PathBuf;
     use std::time::Instant;
@@ -33,10 +41,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         PathBuf::from(args.get(i + 1).ok_or("missing model-dir value")?)
     } else {
         let paths = Paths::from_env();
-        paths
-            .cache_dir
-            .join("sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8")
+        paths.cache_dir.join(STREAMING_ZIPFORMER_EN.extracted_dir)
     };
+    let print_partials = args.iter().any(|a| a == "--partials");
 
     println!("Model dir: {}", model_dir.display());
     println!("WAV: {}", wav_path.display());
@@ -44,23 +51,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bundle = ModelBundle::from_dir(&model_dir);
     println!("Loading model (provider=cpu)...");
     let t = Instant::now();
-    let mut transcriber = SherpaTranscriber::load(&bundle, "cpu", 4)?;
+    let mut transcriber =
+        SherpaStreamingTranscriber::load(&bundle, &StreamingConfig::default())?;
     println!("  loaded in {:?}", t.elapsed());
 
     let samples = read_wav_to_16khz_mono_f32(&wav_path)?;
+    let sample_rate_f = SAMPLE_RATE_HZ as f32;
     println!(
-        "Audio: {} samples ({:.2} s at 16 kHz)",
+        "Audio: {} samples ({:.2} s at {} Hz)",
         samples.len(),
-        samples.len() as f32 / 16_000.0
+        samples.len() as f32 / sample_rate_f,
+        SAMPLE_RATE_HZ
     );
 
+    // Feed in 120 ms chunks to match the daemon's accept-waveform / poll cadence.
+    let chunk_size = (SAMPLE_RATE_HZ as usize) * 120 / 1000;
+    let mut driver = StreamingDriver::new();
     let t = Instant::now();
-    let text = transcriber.transcribe(&samples)?;
+    for window in samples.chunks(chunk_size) {
+        let update = driver.ingest(window, &mut transcriber)?;
+        if print_partials {
+            if let Some(t) = update {
+                println!("[partial] {}", t.render());
+            }
+        }
+    }
+    let final_transcript = driver.finalize(&mut transcriber)?;
     let elapsed = t.elapsed();
-    let audio_s = samples.len() as f32 / 16_000.0;
-    let rtf = elapsed.as_secs_f32() / audio_s;
+
+    let audio_s = samples.len() as f32 / sample_rate_f;
+    let rtf = elapsed.as_secs_f32() / audio_s.max(0.001);
     println!();
-    println!("Transcript: {text}");
+    println!("Transcript: {}", final_transcript.render());
     println!("Inference: {:?} ({:.3}x realtime)", elapsed, 1.0 / rtf);
     Ok(())
 }
@@ -87,10 +109,11 @@ fn read_wav_to_16khz_mono_f32(
             chan_avg_f32(&samples, channels)
         }
     };
-    if sample_rate == 16_000 {
+    use scribed::audio::SAMPLE_RATE_HZ;
+    if sample_rate == SAMPLE_RATE_HZ {
         Ok(raw_mono)
     } else {
-        Ok(resample(&raw_mono, sample_rate, 16_000))
+        Ok(resample(&raw_mono, sample_rate, SAMPLE_RATE_HZ))
     }
 }
 

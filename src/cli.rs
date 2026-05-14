@@ -78,7 +78,7 @@ pub fn run() -> Result<()> {
         }
         Command::FetchModel => {
             let target = crate::asr::download::ensure(
-                &crate::asr::download::PARAKEET_TDT_0_6B_V2,
+                &crate::asr::download::STREAMING_ZIPFORMER_EN,
                 &paths.cache_dir,
             )
             .map_err(|e| anyhow::anyhow!("{e}"))?;

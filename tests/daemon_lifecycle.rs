@@ -3,6 +3,17 @@
 //! Spawns `scribed start --background`, waits for it to come up, verifies
 //! `status` reports it running, sends `toggle`, then `stop`. Asserts the
 //! daemon is gone and the PID file is cleaned up.
+//!
+//! **Model independence.** The toggle path checks `recording : true` against
+//! the IPC state flag, which the daemon flips before (and independently of)
+//! starting an ASR session — see `IpcHandler::handle` for `DaemonCommand::Toggle`
+//! at src/lifecycle/mod.rs around line 445. This means the test passes whether
+//! or not the streaming Zipformer bundle is on disk in CI: a missing model
+//! makes `run_loop` log a warning and leave `runtime = None`, but state
+//! toggling still works. If a future change ever moves the state flip *after*
+//! a successful `Runtime::start_session`, this test would gain an implicit
+//! model dependency and must either ship its own model fixture or gate that
+//! single assertion behind a `cfg(model_present)` probe.
 
 use std::process::Command;
 use std::thread::sleep;

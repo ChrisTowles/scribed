@@ -1,10 +1,8 @@
 //! ASR bounded context — engines that turn audio chunks into transcripts.
 //!
-//! The [`driver`] submodule houses the engine-agnostic streaming logic
-//! (rolling buffer, silence gate, silence reset). The [`sherpa`] submodule
+//! [`driver`] holds the engine-agnostic [`StreamingDriver`] that turns
+//! frame-level recognizer updates into a cumulative transcript. [`sherpa`]
 //! (gated behind `--features asr`) is the production backend.
-
-use std::sync::Arc;
 
 use thiserror::Error;
 
@@ -14,10 +12,41 @@ pub mod driver;
 #[cfg(feature = "asr")]
 pub mod sherpa;
 
-pub use driver::{DriverConfig, StreamingDriver, Transcriber};
+pub use driver::{StreamingDriver, StreamingTranscriber, StreamingUpdate};
 
-/// A committed transcript fragment. Once a [`Segment`] is produced (by a
-/// silence reset), it is immutable: subsequent passes will not rewrite it.
+/// Tuning knobs for the streaming recognizer's rule-based endpoint detector.
+///
+/// Lives at module root (not under `sherpa`) so the [`Config`] layer can
+/// build it without depending on the `asr` feature.
+///
+/// [`Config`]: crate::config::Config
+#[derive(Debug, Clone, Copy)]
+pub struct EndpointRules {
+    /// Seconds of trailing silence required to fire an endpoint when nothing
+    /// has been decoded yet. Catches "user opened the hotkey then walked away".
+    pub rule1_min_trailing_silence: f32,
+    /// Seconds of trailing silence required after non-blank tokens have been
+    /// decoded. The main "user paused at the end of a sentence" trigger.
+    pub rule2_min_trailing_silence: f32,
+    /// Hard ceiling on a single utterance in seconds. Forces an endpoint when
+    /// speech exceeds this length. (Sherpa names the C-API field
+    /// `rule3_min_utterance_length`, with "min" meaning "min length to *fire*";
+    /// the user-visible meaning is a max.)
+    pub rule3_max_utterance_seconds: f32,
+}
+
+impl Default for EndpointRules {
+    fn default() -> Self {
+        Self {
+            rule1_min_trailing_silence: 2.4,
+            rule2_min_trailing_silence: 1.0,
+            rule3_max_utterance_seconds: 20.0,
+        }
+    }
+}
+
+/// A committed transcript fragment. Produced when the streaming recognizer
+/// signals an endpoint; immutable thereafter.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Segment {
     pub text: String,
@@ -59,26 +88,6 @@ pub enum AsrError {
     Inference(String),
     #[error("model not yet loaded")]
     NotLoaded,
-}
-
-/// A callback the engine fires whenever the transcript changes.
-pub type TranscriptCallback = Arc<dyn Fn(&Transcript) + Send + Sync>;
-
-/// Implemented by every ASR backend (`SherpaEngine`, eventual `ParakeetRsEngine`).
-pub trait AsrEngine: Send {
-    /// Eagerly load the model. May block for tens of seconds.
-    fn load(&mut self) -> Result<(), AsrError>;
-
-    /// Begin a recording session. The engine starts emitting transcripts via
-    /// the callback set at construction.
-    fn start(&mut self) -> Result<(), AsrError>;
-
-    /// End the recording session. The engine flushes any pending audio and
-    /// emits a final transcript before returning.
-    fn stop(&mut self) -> Result<(), AsrError>;
-
-    /// Describe the input device this engine is using. Informational.
-    fn input_device_name(&self) -> String;
 }
 
 #[cfg(test)]

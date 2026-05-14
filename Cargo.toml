@@ -4,10 +4,10 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.78"
 license = "MIT"
-description = "Local streaming dictation daemon (Parakeet ASR)"
+description = "Local streaming dictation daemon (sherpa-onnx streaming RNN-T)"
 repository = "https://github.com/ChrisTowles/scribed"
 readme = "README.md"
-keywords = ["dictation", "speech-to-text", "asr", "parakeet", "daemon"]
+keywords = ["dictation", "speech-to-text", "asr", "streaming", "daemon"]
 categories = ["command-line-utilities", "multimedia::audio"]
 
 [features]
@@ -49,8 +49,11 @@ rodio = { version = "0.19", default-features = false, features = ["vorbis"] }
 indicatif = "0.17"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "stream"] }
 
-# Optional ASR backend
-sherpa-rs = { version = "0.6", optional = true }
+# Optional ASR backend. default-features = false drops sherpa-rs's `tts`
+# default (unused here); `download-binaries` and `sys` we keep explicitly.
+# `sys` re-exports `sherpa_rs_sys` so we can reach the OnlineRecognizer C API
+# (no high-level Rust wrapper exists for streaming).
+sherpa-rs = { version = "0.6", default-features = false, features = ["download-binaries", "sys"], optional = true }
 
 # Used by the transcribe_wav smoke-test binary (feature = "asr")
 hound = "3"

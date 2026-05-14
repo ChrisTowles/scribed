@@ -130,7 +130,10 @@ pub fn status(paths: &Paths, config: &Config) -> crate::Result<()> {
     println!("  socket     : {}", paths.control_socket.display());
     println!("  hotkey     : {}", config.hotkey);
     println!("  mode       : {:?}", config.mode);
-    println!("  model      : {}", config.model);
+    println!(
+        "  model      : {}",
+        crate::asr::download::STREAMING_ZIPFORMER_EN.name
+    );
     println!(
         "  output     : {}",
         crate::output::backend::select_backend_kind().as_str()
@@ -262,7 +265,7 @@ fn run_loop(paths: &Paths, config: &Config) -> crate::Result<()> {
     let runtime: Option<Arc<Mutex<crate::service::Runtime>>> = {
         let model_dir = paths
             .cache_dir
-            .join("sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8");
+            .join(crate::asr::download::STREAMING_ZIPFORMER_EN.extracted_dir);
         match crate::service::Runtime::load(config, model_dir.clone()) {
             Ok(rt) => Some(Arc::new(Mutex::new(rt))),
             Err(e) => {

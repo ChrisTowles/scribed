@@ -1,6 +1,6 @@
 # scribed
 
-Local streaming dictation daemon. Press a hotkey, speak, the text appears in your focused window. Powered by NVIDIA Parakeet-TDT via sherpa-onnx; runs offline.
+Local streaming dictation daemon. Press a hotkey, speak, the text appears in your focused window — with the partials mutating in place as the recognizer hears more, then settling on the final hypothesis. Powered by a streaming Zipformer RNN-T transducer (k2-fsa, via sherpa-onnx); runs offline.
 
 Linux (X11 + Wayland) and macOS (Apple Silicon). Native single binary.
 
@@ -16,13 +16,13 @@ In development. The Rust port of [claude-stt](https://github.com/) (Python). Pha
 # Build with the ASR engine (downloads sherpa-onnx native libs into target/)
 cargo build --release
 
-# Fetch the Parakeet model bundle (~460 MB, cached at ~/.cache/scribed/)
+# Fetch the streaming Zipformer model bundle (~100 MB, cached at ~/.cache/scribed/)
 ./target/release/scribed fetch-model
 
 # End-to-end smoke test: transcribe a WAV without starting the daemon
-./target/release/transcribe_wav ~/.cache/scribed/sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8/test_wavs/0.wav
+./target/release/transcribe_wav ~/.cache/scribed/sherpa-onnx-streaming-zipformer-en-2023-06-26/test_wavs/0.wav
 # → Transcript:  Well, I don't wish to see it any more, observed Phebe,...
-# → Inference: ~115 ms (64x realtime on CPU)
+# → Inference: ~150 ms (40x realtime on CPU)
 
 # Daemon control
 ./target/release/scribed status

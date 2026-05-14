@@ -1,9 +1,9 @@
-//! Lazy model download. The Parakeet bundle is ~600 MB; we fetch it once and
-//! cache under [`crate::paths::Paths::cache_dir`].
+//! Lazy model download. Streaming Zipformer English transducer is ~100 MB;
+//! we fetch it once and cache under [`crate::paths::Paths::cache_dir`].
 //!
-//! Sherpa-onnx publishes prebuilt Parakeet bundles as `.tar.bz2` archives on
-//! a public CDN; the URLs and SHA-256 sums are tracked in `models.toml` so
-//! they can be updated without code changes.
+//! Sherpa-onnx publishes prebuilt streaming models as `.tar.bz2` archives on
+//! GitHub Releases; we point at one well-known English bundle and let
+//! advanced users swap in their own by dropping files into the cache dir.
 
 use std::fs;
 use std::io::{Read, Write};
@@ -13,8 +13,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 
 use crate::asr::AsrError;
 
-/// A named model bundle. The asr engine resolves a model name (e.g.
-/// `nvidia/parakeet-tdt-0.6b-v2`) to one of these and ensures it is on disk.
+/// A named model bundle.
 #[derive(Debug, Clone)]
 pub struct ModelArchive {
     pub name: &'static str,
@@ -22,11 +21,11 @@ pub struct ModelArchive {
     pub extracted_dir: &'static str,
 }
 
-pub const PARAKEET_TDT_0_6B_V2: ModelArchive = ModelArchive {
-    name: "parakeet-tdt-0.6b-v2",
-    // The sherpa-onnx Parakeet bundle, hosted by k2-fsa on GitHub releases.
-    url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8.tar.bz2",
-    extracted_dir: "sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8",
+/// Streaming Zipformer English transducer (k2-fsa, LibriSpeech, RNN-T, 16 kHz).
+pub const STREAMING_ZIPFORMER_EN: ModelArchive = ModelArchive {
+    name: "streaming-zipformer-en-2023-06-26",
+    url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-streaming-zipformer-en-2023-06-26.tar.bz2",
+    extracted_dir: "sherpa-onnx-streaming-zipformer-en-2023-06-26",
 };
 
 /// Ensure the named model exists locally. Returns the directory containing the
@@ -109,9 +108,9 @@ mod tests {
     #[test]
     fn ensure_returns_cached_path_without_network() {
         let dir = tempdir().unwrap();
-        let prebuilt = dir.path().join(PARAKEET_TDT_0_6B_V2.extracted_dir);
+        let prebuilt = dir.path().join(STREAMING_ZIPFORMER_EN.extracted_dir);
         fs::create_dir_all(&prebuilt).unwrap();
-        let result = ensure(&PARAKEET_TDT_0_6B_V2, dir.path()).unwrap();
+        let result = ensure(&STREAMING_ZIPFORMER_EN, dir.path()).unwrap();
         assert_eq!(result, prebuilt);
     }
 }

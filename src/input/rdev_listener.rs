@@ -31,8 +31,6 @@ use crate::input::{
 pub enum RdevError {
     #[error("Accessibility permission not granted (System Settings → Privacy & Security → Accessibility)")]
     Permission,
-    #[error("rdev listen failed: {0:?}")]
-    Listen(rdev::ListenError),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -63,8 +61,6 @@ impl RdevListener {
         let aggregator = Arc::new(parking_lot::Mutex::new(Aggregator::new(chord, mode)));
         let on_intent: Arc<dyn Fn(RecordingIntent) + Send + Sync> = Arc::new(on_intent);
 
-        let agg = aggregator.clone();
-        let intent_cb = on_intent.clone();
         let handle = thread::Builder::new()
             .name("scribed-rdev".into())
             .spawn(move || {
@@ -78,11 +74,11 @@ impl RdevListener {
                         return;
                     };
                     let intent = {
-                        let mut a = agg.lock();
+                        let mut a = aggregator.lock();
                         a.observe(KeyEvent { key: name, state })
                     };
                     if let Some(intent) = intent {
-                        (intent_cb)(intent);
+                        (on_intent)(intent);
                     }
                 };
                 if let Err(e) = rdev::listen(callback) {

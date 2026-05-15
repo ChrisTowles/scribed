@@ -11,6 +11,9 @@ pub mod aggregator;
 #[cfg(target_os = "linux")]
 pub mod evdev_listener;
 
+#[cfg(target_os = "macos")]
+pub mod rdev_listener;
+
 pub use aggregator::{Aggregator, KeyEvent, KeyName, KeyState};
 
 /// What the orchestration layer should do in response to a hotkey event.

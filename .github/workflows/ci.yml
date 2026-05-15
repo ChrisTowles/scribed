@@ -27,7 +27,7 @@ jobs:
       matrix:
         os:
           - ubuntu-latest
-          # - macos-14  # re-enable once macOS build is supported (sherpa-onnx download + rustup setup)
+          - macos-14
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -35,6 +35,8 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
       - name: install linux deps
         if: matrix.os == 'ubuntu-latest'
         run: |
@@ -49,12 +51,14 @@ jobs:
       matrix:
         os:
           - ubuntu-latest
-          # - macos-14  # re-enable once macOS build is supported (sherpa-onnx download + rustup setup)
+          - macos-14
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
       # sherpa-onnx-sys's build script downloads prebuilt native libs into
       # target/<profile>/sherpa-onnx-prebuilt/. rust-cache covers that path.
       # Daemon `run` fetches the streaming Nemotron bundle on startup

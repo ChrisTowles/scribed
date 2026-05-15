@@ -101,7 +101,7 @@ impl Default for Config {
             endpoint_rule1_silence_seconds: 2.4,
             endpoint_rule2_silence_seconds: 1.0,
             endpoint_rule3_max_utterance_seconds: 20.0,
-            silence_threshold_dbfs: -28.0,
+            silence_threshold_dbfs: -36.0,
             output_mode: OutputMode::Auto,
             sound_effects: true,
             soft_newlines: true,
@@ -276,7 +276,7 @@ mod tests {
         assert_eq!(c.endpoint_rule1_silence_seconds, 2.4);
         assert_eq!(c.endpoint_rule2_silence_seconds, 1.0);
         assert_eq!(c.endpoint_rule3_max_utterance_seconds, 20.0);
-        assert_eq!(c.silence_threshold_dbfs, -28.0);
+        assert_eq!(c.silence_threshold_dbfs, -36.0);
         assert_eq!(c.max_recording_seconds, 300);
         assert_eq!(c.silence_auto_stop_seconds, 60);
         assert!(c.sound_effects);

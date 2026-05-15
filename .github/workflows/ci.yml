@@ -35,6 +35,8 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
       - name: install linux deps
         if: matrix.os == 'ubuntu-latest'
         run: |
@@ -55,6 +57,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
       # sherpa-onnx-sys's build script downloads prebuilt native libs into
       # target/<profile>/sherpa-onnx-prebuilt/. rust-cache covers that path.
       # Daemon `run` fetches the streaming Nemotron bundle on startup

@@ -4,7 +4,6 @@ use std::path::{Path, PathBuf};
 
 pub mod sound;
 
-#[cfg(target_os = "linux")]
 pub mod desktop;
 
 pub use sound::SoundPlayer;
@@ -97,14 +96,7 @@ impl Notifier for PlatformNotifier {
     }
 
     fn notify(&self, title: &str, body: &str) {
-        #[cfg(target_os = "linux")]
-        {
-            desktop::post(title, body);
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = (title, body);
-        }
+        desktop::post(title, body);
     }
 }
 

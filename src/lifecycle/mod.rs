@@ -422,7 +422,64 @@ fn start_hotkey_listener(
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+fn start_hotkey_listener(
+    config: &Config,
+    state: Arc<Mutex<DaemonState>>,
+    #[cfg(feature = "asr")] runtime: Option<Arc<Mutex<crate::service::Runtime>>>,
+) -> Option<crate::input::rdev_listener::RdevListener> {
+    use crate::input::rdev_listener::{RdevError, RdevListener};
+    use crate::input::{KeyChord, RecordingIntent};
+
+    let chord = match KeyChord::parse(&config.hotkey) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(hotkey = %config.hotkey, ?e, "invalid hotkey; listener disabled");
+            return None;
+        }
+    };
+    let chord_display = chord.to_string();
+    match RdevListener::start(chord, config.mode, move |intent| {
+        let recording = match intent {
+            RecordingIntent::Start => true,
+            RecordingIntent::Stop => false,
+            RecordingIntent::Toggle => !state.lock().recording,
+        };
+        state.lock().recording = recording;
+        tracing::info!(?intent, recording, "hotkey");
+        #[cfg(feature = "asr")]
+        if let Some(rt) = &runtime {
+            let mut rt = rt.lock();
+            if recording {
+                rt.start_session();
+            } else {
+                rt.stop_session();
+            }
+        }
+    }) {
+        Ok(listener) => {
+            tracing::info!(hotkey = %chord_display, "hotkey listener active");
+            Some(listener)
+        }
+        Err(RdevError::Permission) => {
+            tracing::warn!(
+                "macOS hotkey listener disabled: grant Accessibility under \
+                 System Settings → Privacy & Security → Accessibility, then \
+                 restart scribed (see docs/SETUP.md)"
+            );
+            None
+        }
+        Err(e) => {
+            tracing::warn!(
+                ?e,
+                "hotkey listener failed to start; daemon will run without global hotkey"
+            );
+            None
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn start_hotkey_listener(
     _config: &Config,
     _state: Arc<Mutex<DaemonState>>,

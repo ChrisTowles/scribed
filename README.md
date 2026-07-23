@@ -1,3 +1,21 @@
+<div align="center">
+
+<a href="https://github.com/cjpais/handy">
+  <img src="https://img.shields.io/badge/⛔%20DO%20NOT%20USE%20THIS%20REPO-red?style=for-the-badge&labelColor=red" alt="Do not use this repo" height="70">
+  <br>
+  <img src="https://img.shields.io/badge/👉%20DOWNLOAD%20HANDY%20INSTEAD%20—%20it's%20amazing%20👈-brightgreen?style=for-the-badge&labelColor=2ea44f" alt="Download Handy instead" height="70">
+</a>
+
+### ⚠️ This repository is **archived** and no longer maintained.
+
+# 🚨 Go download [**Handy**](https://github.com/cjpais/handy) instead — it's an amazing project. 🚨
+
+### 👉 https://github.com/cjpais/handy 👈
+
+</div>
+
+---
+
 # scribed
 
 Local streaming dictation daemon. Press a hotkey, speak, the text appears in your focused window — with the partials mutating in place as the recognizer hears more, then settling on the final hypothesis. Powered by a streaming Zipformer RNN-T transducer (k2-fsa, via sherpa-onnx); runs offline.
